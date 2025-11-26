@@ -1,0 +1,15 @@
+# iFocus SDK Python Dependencies
+
+# BLE Communication
+bleak>=0.21.0
+
+# Scientific Computing
+numpy>=1.20.0
+scipy>=1.7.0
+
+# EDF/BDF File Handling
+pyedflib>=0.1.30
+
+# Machine Learning
+scikit-learn>=1.0.0
+joblib>=1.0.0
