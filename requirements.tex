@@ -1,0 +1,325 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{amssymb}   % for \square
+\usepackage{graphicx}  % for logo
+\usepackage{fancyhdr}  % for header/footer
+
+\setlength{\headheight}{20pt}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\includegraphics[height=1cm]{logo.png}}
+\rhead{Niantong Intelligence}
+\cfoot{\thepage}
+
+\begin{document}
+	
+	\begin{center}
+		{\LARGE \textbf{iFocus Android SDK -- Deliverables \& Function Specification}}\\[0.5em]
+		{\large Niantong Intelligence}\\[1em]
+	\end{center}
+	
+	\section*{Overview}
+	
+	This document describes the deliverables and function-level specification for the iFocus Android SDK.
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item The SDK connects to the iFocus EEG device over Bluetooth on an Android tablet.
+		\item The SDK collects EEG signals internally and outputs a per-subject focus/attention score in real time.
+		\item All signal processing and model logic are internal; the client application only interacts with high-level functions and callbacks.
+	\end{itemize}
+	
+	\section*{Implementation Language \& Packaging}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item The SDK will be implemented in \textbf{Kotlin} for Android.
+		\item All public APIs will be usable from both \textbf{Kotlin and Java} (full Java interoperability).
+		\item The SDK will be distributed as an Android \texttt{.aar} file or via a Maven dependency.
+		\item All processing is performed locally on-device; no network connection is required (offline support).
+	\end{itemize}
+	
+	\section*{Task 1: Device Integration}
+	
+	\subsection*{1.1 Bluetooth Scanning \& Connection}
+	
+	\paragraph{Scan for devices (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{startDeviceScan(callback)}
+		\begin{itemize}
+			\item Starts Bluetooth scanning for nearby iFocus devices.
+			\item The callback delivers, for each discovered device:
+			\begin{itemize}
+				\item Device name.
+				\item MAC address / deviceId.
+				\item RSSI at discovery time.
+			\end{itemize}
+		\end{itemize}
+		
+		\item \textbf{Function:} \texttt{stopDeviceScan()}
+		\begin{itemize}
+			\item Stops scanning for nearby devices.
+		\end{itemize}
+	\end{itemize}
+	
+	\paragraph{Connect / disconnect (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{connect(deviceId, autoReconnect = false, callback)}
+		\begin{itemize}
+			\item Establishes a BLE connection to the specified device.
+			\item If \texttt{autoReconnect} is \texttt{true}, the SDK will automatically attempt to reconnect if the BLE link drops unexpectedly.
+			\item The callback provides:
+			\begin{itemize}
+				\item A success flag (true/false).
+				\item An error code if the connection fails.
+			\end{itemize}
+		\end{itemize}
+		
+		\item \textbf{Function:} \texttt{disconnect()}
+		\begin{itemize}
+			\item Disconnects from the currently connected device.
+			\item A disconnection event will be reported via the appropriate callback.
+		\end{itemize}
+	\end{itemize}
+	
+	\subsection*{1.2 RSSI (Bluetooth Signal Strength)}
+	
+	\paragraph{RSSI access (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{getCurrentRssi()}
+		\begin{itemize}
+			\item Returns the most recently known RSSI value for the active connection.
+			\item The application may call this function whenever it wishes to read the current link quality.
+		\end{itemize}
+	\end{itemize}
+	
+	\paragraph{Note on signal quality.}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item The current device firmware does not expose a separate EEG contact/signal-quality metric.
+		\item The SDK will provide \textbf{Bluetooth link quality} via RSSI only.
+		\item Any ``quality display'' in the demo will be based on RSSI.
+	\end{itemize}
+	
+	\subsection*{1.3 Battery Level}
+	
+	\paragraph{Battery level (not supported).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item The current iFocus device firmware does not expose battery information.
+		\item No battery-related API will be provided in the SDK.
+	\end{itemize}
+	
+	\subsection*{1.4 Wearing Detection}
+	
+	\paragraph{Wearing status (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{getWearingStatus()}
+		\begin{itemize}
+			\item Returns the latest known wearing status:
+			\begin{itemize}
+				\item \texttt{true} = the device is detected as being worn.
+				\item \texttt{false} = the device is detected as not being worn.
+			\end{itemize}
+			\item The application may call this function whenever it wishes to read the current wearing state.
+		\end{itemize}
+	\end{itemize}
+	
+	\section*{Task 2: Focus Model Pipeline (Per Subject)}
+	
+	For each subject (user), the SDK supports the following stages:
+	
+	\begin{enumerate}[leftmargin=1.5em]
+		\item Calibration data collection for two mental states (focus, relax).
+		\item Model training using the stored calibration data for that subject.
+		\item Focus inference using the trained subject-specific model and live EEG data.
+	\end{enumerate}
+	
+	All EEG data and model parameters are handled internally by the SDK; the client does not need to manage raw training data or models.
+	
+	\subsection*{2.1 Calibration Data Collection}
+	
+	Calibration is used to collect labeled data for two mental states (such as focus and relax). The application can start and stop calibration for each state, and repeat as needed.
+	
+	\paragraph{Start calibration (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{startCalibration(subjectId, stateLabel)}
+		\begin{itemize}
+			\item Deletes previously recorded calibration data for the specified subject.
+			\item Allows the application to reset and perform a fresh calibration if desired.
+			\item Begins recording calibration data for the specified subject.
+			\item \texttt{stateLabel} indicates the mental state during this period (e.g., FOCUS, RELAX).
+			\item While calibration is active, the SDK continuously records EEG data from the connected device and tags it with:
+			\begin{itemize}
+				\item \texttt{subjectId}.
+				\item \texttt{stateLabel}.
+			\end{itemize}
+		\end{itemize}
+	\end{itemize}
+	
+	\paragraph{Stop calibration (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{stopCalibration()}
+		\begin{itemize}
+			\item Stops recording calibration data for the current session.
+			\item The collected data segment is stored internally for the active subject and state label.
+			\item No model is trained at this step; this function only stops data collection.
+		\end{itemize}
+	\end{itemize}
+	
+	
+	\subsection*{2.2 Train Focus Model}
+	
+	Once calibration data for different conditions (e.g., focus and relax) has been collected, the SDK can train a subject-specific focus model.
+	
+	\paragraph{Train and save model (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{trainFocusModel(subjectId, callback)}
+		\begin{itemize}
+			\item Loads all stored calibration data for the given subject.
+			\item Trains a focus/attention model internally for that subject.
+			\item Saves the trained model associated with the subject ID.
+			\item The callback reports:
+			\begin{itemize}
+				\item A success flag (true/false).
+				\item A message or error description.
+				\item The number of calibration samples used for training.
+			\end{itemize}
+		\end{itemize}
+	\end{itemize}
+	
+	\paragraph{Automatic save/load behavior.}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item Trained models are automatically saved by the SDK when \texttt{trainFocusModel} completes successfully.
+		\item When performing inference, the SDK automatically loads the corresponding model based on \texttt{subjectId}; no explicit save/load API is required from the client.
+	\end{itemize}
+	
+	\subsection*{2.3 Focus Inference}
+	
+	After a model has been trained for a subject, the SDK can perform real-time inference on live data coming from the connected device and output a focus/attention score.
+	
+	\paragraph{Start focus inference (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{startFocusInference(subjectId, updateHz, callback)}
+		\begin{itemize}
+			\item Loads the trained model associated with the specified subject ID.
+			\item Uses live EEG from the connected device as testing data.
+			\item At the specified update frequency (\texttt{updateHz}), the SDK:
+			\begin{itemize}
+				\item Reads an internal window of EEG data.
+				\item Applies the subject-specific model.
+				\item Calls the callback with:
+				\begin{itemize}
+					\item Focus/attention score (e.g., 1--100).
+					\item Timestamp.
+					\item Optional RSSI.
+					\item Optional wearing status.
+				\end{itemize}
+			\end{itemize}
+			\item If no trained model exists for the subject, an appropriate error is reported.
+		\end{itemize}
+	\end{itemize}
+	
+	\paragraph{Stop focus inference (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{stopFocusInference()}
+		\begin{itemize}
+			\item Stops performing focus inference on live data.
+			\item The SDK ceases calling the focus inference callback.
+		\end{itemize}
+	\end{itemize}
+	
+	\section*{Task 3: Error Handling \& Logging}
+	
+	\subsection*{3.1 Error Reporting}
+	
+	\paragraph{Error callback (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{setErrorCallback(callback)}
+		\begin{itemize}
+			\item Registers a callback which receives:
+			\begin{itemize}
+				\item An error code.
+				\item A short error message.
+			\end{itemize}
+			\item Used for reporting connection issues, calibration errors, model training errors, inference errors, etc.
+		\end{itemize}
+	\end{itemize}
+	
+	\subsection*{3.2 Debug Logging}
+	
+	\paragraph{Debug logging control (will be provided).}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item \textbf{Function:} \texttt{enableDebugLogging(enable)}
+		\begin{itemize}
+			\item Enables or disables internal SDK debug logging.
+			\item Intended for development and troubleshooting.
+		\end{itemize}
+	\end{itemize}
+	
+	\section*{Demo Application Deliverables}
+	
+	A demo application will be delivered that demonstrates:
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item Scanning and connecting to the iFocus device.
+		\item Displaying RSSI as a link-quality indicator.
+		\item Displaying wearing status using \texttt{getWearingStatus()}.
+		\item Running calibration sessions:
+		\begin{itemize}
+			\item Start calibration (focus).
+			\item Stop calibration.
+			\item Start calibration (relax).
+			\item Stop calibration.
+		\end{itemize}
+		\item Training the focus model for a subject using collected calibration data.
+		\item Running focus inference and displaying the focus score over time.
+		\item Showing errors and logs for debugging.
+	\end{itemize}
+	
+	\section*{SDK Versioning, Firmware \& License}
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item SDK documentation will specify:
+		\begin{itemize}
+			\item Supported Android versions and CPU architecture.
+			\item Minimum required firmware version for the iFocus device.
+			\item SDK versioning and compatibility notes.
+		\end{itemize}
+		\item License and activation requirements (if any) will be documented separately according to commercial agreements.
+	\end{itemize}
+	
+	\section*{Final Function Checklist for Delivery}
+	
+	Total number of public SDK functions described in this document: \textbf{14}.
+	
+	\begin{itemize}[leftmargin=1.5em]
+		\item $\square$ \texttt{startDeviceScan(callback)}
+		\item $\square$ \texttt{stopDeviceScan()}
+		\item $\square$ \texttt{connect(deviceId, autoReconnect, callback)}
+		\item $\square$ \texttt{disconnect()}
+		\item $\square$ \texttt{getCurrentRssi()}
+		\item $\square$ \texttt{getWearingStatus()}
+		\item $\square$ \texttt{startCalibration(subjectId, stateLabel)}
+		\item $\square$ \texttt{stopCalibration()}
+		\item $\square$ \texttt{trainFocusModel(subjectId, callback)}
+		\item $\square$ \texttt{startFocusInference(subjectId, updateHz, callback)}
+		\item $\square$ \texttt{stopFocusInference()}
+		\item $\square$ \texttt{setErrorCallback(callback)}
+		\item $\square$ \texttt{enableDebugLogging(enable)}
+	\end{itemize}
+	
+\end{document}
