@@ -1,49 +1,23 @@
-# iFocus Game device selection UI (PySide6)
-# pip install pyside6
-# Requires: assets/logo.png
-
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
-import random
 from typing import List, Optional, Set
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QPainter, QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPushButton,
-    QSizePolicy,
     QVBoxLayout,
     QHBoxLayout,
     QWidget,
     QGridLayout,
 )
-
-
-# -----------------------------
-# Stubs you will wire up later
-# -----------------------------
-def scan_devices_stub() -> List[dict]:
-    demo = [
-        {"name": "Player 1", "mac": "00:11:22:33:44:55", "rssi": random.randint(-90, -40)},
-        {"name": "Player 2", "mac": "66:77:88:99:AA:BB", "rssi": random.randint(-90, -40)},
-        {"name": "Player 3", "mac": "CC:DD:EE:FF:00:11", "rssi": random.randint(-90, -40)},
-        {"name": "Player 4", "mac": "22:33:44:55:66:77", "rssi": random.randint(-90, -40)},
-    ]
-    random.shuffle(demo)
-    return demo[: random.randint(1, 4)]
-
-
-def connect_device_stub(mac: str) -> None:
-    print(f"[CONNECT] {mac}")
-
-
-def disconnect_device_stub(mac: str) -> None:
-    print(f"[DISCONNECT] {mac}")
 
 
 # -----------------------------
@@ -64,7 +38,6 @@ class AvatarWidget(QWidget):
         super().__init__(parent)
         self.ui_scale = ui_scale
         self.accent: QColor = QColor("#60A5FA")
-        self.setObjectName("Avatar")
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
     def set_accent(self, accent: QColor):
@@ -110,10 +83,8 @@ class PlayerCard(QFrame):
         self.ui_scale = ui_scale
         self.device: Optional[DeviceInfo] = None
         self.selected: bool = False
-        self.accent: QColor = QColor("#60A5FA")
 
         self.setObjectName("PlayerCard")
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setCursor(Qt.PointingHandCursor)
 
         avatar_size = int(72 * ui_scale)
@@ -121,17 +92,25 @@ class PlayerCard(QFrame):
         self.avatar = AvatarWidget(ui_scale, self)
         self.avatar.setFixedSize(avatar_size, avatar_size)
 
-        self.name_lbl = QLabel("", self)
-        self.name_lbl.setObjectName("NameLabel")
+        self.name_lbl = QLineEdit(self)
+        self.name_lbl.setObjectName("NameEdit")
         self.name_lbl.setAlignment(Qt.AlignHCenter)
+        self.name_lbl.setPlaceholderText("Enter name")
 
-        self.mac_lbl = QLabel("", self)
+        # Wearing status indicator
+        self.wearing_indicator = QLabel(self)
+        self.wearing_indicator.setObjectName("WearingIndicator")
+        indicator_size = int(12 * ui_scale)
+        self.wearing_indicator.setFixedSize(indicator_size, indicator_size)
+
+        self.wearing_text = QLabel("Wearing Status", self)
+        self.wearing_text.setObjectName("WearingText")
+
+        self.mac_lbl = QLabel(self)
         self.mac_lbl.setObjectName("MetaLabel")
-        self.mac_lbl.setAlignment(Qt.AlignHCenter)
 
-        self.rssi_lbl = QLabel("", self)
+        self.rssi_lbl = QLabel(self)
         self.rssi_lbl.setObjectName("MetaLabel")
-        self.rssi_lbl.setAlignment(Qt.AlignHCenter)
 
         self.pill = QLabel("Connected", self)
         self.pill.setObjectName("Pill")
@@ -144,8 +123,19 @@ class PlayerCard(QFrame):
         layout.setSpacing(int(10 * ui_scale))
         layout.addWidget(self.avatar, 0, Qt.AlignHCenter)
         layout.addWidget(self.name_lbl)
-        layout.addWidget(self.mac_lbl)
-        layout.addWidget(self.rssi_lbl)
+
+        # Wearing status row
+        wearing_row = QHBoxLayout()
+        wearing_row.setSpacing(int(6 * ui_scale))
+        wearing_row.addStretch(1)
+        wearing_row.addWidget(self.wearing_indicator, 0, Qt.AlignVCenter)
+        wearing_row.addWidget(self.wearing_text, 0, Qt.AlignVCenter)
+        wearing_row.addStretch(1)
+        layout.addLayout(wearing_row)
+
+        # MAC address
+        layout.addWidget(self.mac_lbl, 0, Qt.AlignHCenter)
+        layout.addWidget(self.rssi_lbl, 0, Qt.AlignHCenter)
         layout.addStretch(1)
         layout.addWidget(self.pill, 0, Qt.AlignHCenter)
 
@@ -153,60 +143,72 @@ class PlayerCard(QFrame):
         self._refresh_style()
 
     def _apply_fonts(self):
-        name_font = QFont()
-        name_font.setPointSize(max(12, int(16 * self.ui_scale)))
-        name_font.setWeight(QFont.Bold)
-        self.name_lbl.setFont(name_font)
+        def make_font(point: int, bold: bool = False) -> QFont:
+            f = QFont()
+            f.setPointSize(point)
+            if bold:
+                f.setWeight(QFont.Bold)
+            return f
 
-        meta_font = QFont()
-        meta_font.setPointSize(max(9, int(11 * self.ui_scale)))
-        self.mac_lbl.setFont(meta_font)
-        self.rssi_lbl.setFont(meta_font)
+        self.name_lbl.setFont(make_font(max(12, int(16 * self.ui_scale)), bold=True))
 
-        pill_font = QFont()
-        pill_font.setPointSize(max(8, int(10 * self.ui_scale)))
-        pill_font.setWeight(QFont.Bold)
-        self.pill.setFont(pill_font)
+        meta = make_font(max(9, int(11 * self.ui_scale)))
+        self.mac_lbl.setFont(meta)
+        self.rssi_lbl.setFont(meta)
+        self.wearing_text.setFont(meta)
+
+        self.pill.setFont(make_font(max(8, int(10 * self.ui_scale)), bold=True))
 
     def set_device(self, device: DeviceInfo, accent_hex: str):
         self.device = device
         self.selected = False
-        self.accent = QColor(accent_hex)
-        self.avatar.set_accent(self.accent)
+        accent = QColor(accent_hex)
+        self.avatar.set_accent(accent)
         self.name_lbl.setText(device.name)
         self.mac_lbl.setText(device.mac)
         self.rssi_lbl.setText(f"{device.rssi} dBm")
         self.pill.setVisible(False)
+        self.set_wearing_status(True)
+        self._refresh_style()
+
+    def set_wearing_status(self, is_wearing: bool):
+        self.wearing_indicator.setProperty("wearing", "good" if is_wearing else "bad")
+        self.wearing_indicator.style().unpolish(self.wearing_indicator)
+        self.wearing_indicator.style().polish(self.wearing_indicator)
+
+    def set_selected(self, selected: bool):
+        self.selected = selected
+        self.pill.setVisible(self.selected)
         self._refresh_style()
 
     def mousePressEvent(self, event):
         if not self.device:
             return
         if event.button() == Qt.LeftButton:
-            self.selected = not self.selected
-            self.pill.setVisible(self.selected)
-            self._refresh_style()
+            self.set_selected(not self.selected)
             self.toggled.emit(self)
 
     def _refresh_style(self):
         self.setProperty("selected", "true" if self.selected else "false")
         self.style().unpolish(self)
         self.style().polish(self)
-        self.update()
+
 
 # -----------------------------
-# Main window
+# Main window (pure UI)
 # -----------------------------
 class IFocusWindow(QMainWindow):
+    # UI signals (hooks file listens to these)
+    searchRequested = Signal()
+    deviceToggled = Signal(str, bool)  # mac, selected
+    playRequested = Signal(object)  # list[str]
+
     def __init__(self):
         super().__init__()
 
-        # Compute a simple scale factor from screen size
         screen = QApplication.primaryScreen()
         geo = screen.availableGeometry()
         w, h = geo.width(), geo.height()
-
-        # 1440x900 is a decent “baseline laptop-ish” reference
         self.ui_scale = max(0.85, min(1.45, min(w / 1440.0, h / 900.0)))
 
         self.setWindowTitle("iFocus Game")
@@ -218,17 +220,19 @@ class IFocusWindow(QMainWindow):
         self.setCentralWidget(root)
 
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(int(18 * self.ui_scale), int(18 * self.ui_scale),
-                                 int(18 * self.ui_scale), int(18 * self.ui_scale))
+        outer.setContentsMargins(
+            int(18 * self.ui_scale),
+            int(18 * self.ui_scale),
+            int(18 * self.ui_scale),
+            int(18 * self.ui_scale),
+        )
         outer.setSpacing(int(12 * self.ui_scale))
 
-        # Header: logo stays left, title/subtitle centered
+        # Header
         header = QHBoxLayout()
         header.setSpacing(int(12 * self.ui_scale))
 
         self.logo_lbl = QLabel()
-        self.logo_lbl.setObjectName("Logo")
-        self.logo_lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         logo_path = (Path(__file__).resolve().parents[1] / "assets" / "logo.png")
         self._load_logo(str(logo_path))
 
@@ -253,7 +257,6 @@ class IFocusWindow(QMainWindow):
         title_box.addWidget(self.title)
         title_box.addWidget(self.subtitle)
 
-        # Right spacer matches logo width so the title stays visually centered.
         right_spacer = QWidget()
         right_spacer.setFixedWidth(self.logo_lbl.sizeHint().width())
 
@@ -270,8 +273,7 @@ class IFocusWindow(QMainWindow):
 
         self.search_btn = QPushButton("Search")
         self.search_btn.setObjectName("SearchButton")
-        self.search_btn.setCursor(Qt.PointingHandCursor)
-        self.search_btn.clicked.connect(self.on_search)
+        self.search_btn.clicked.connect(self._on_search_clicked)
 
         row.addWidget(self.search_btn)
         row.addStretch(1)
@@ -287,33 +289,133 @@ class IFocusWindow(QMainWindow):
 
         # Cards area
         self.cards_container = QWidget()
-        self.cards_container.setObjectName("CardsContainer")
         self.grid = QGridLayout(self.cards_container)
         self.grid.setContentsMargins(0, 0, 0, 0)
-        self.grid.setHorizontalSpacing(int(14 * self.ui_scale))
-        self.grid.setVerticalSpacing(int(14 * self.ui_scale))
-        self.cards_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        spacing = int(14 * self.ui_scale)
+        self.grid.setHorizontalSpacing(spacing)
+        self.grid.setVerticalSpacing(spacing)
         outer.addWidget(self.cards_container, 1)
 
         # Play button
         self.play_btn = QPushButton("Play")
         self.play_btn.setObjectName("PlayButton")
-        self.play_btn.setCursor(Qt.PointingHandCursor)
         self.play_btn.setEnabled(False)
-        self.play_btn.clicked.connect(self.on_play)
+        self.play_btn.clicked.connect(self._on_play_clicked)
         outer.addWidget(self.play_btn)
 
         self._apply_styles()
-        self._clear_cards()
+        self.clear_cards()
 
-        # Use a normal maximized window so the OS title bar + close button remain visible.
-        # Fullscreen hides window chrome on Windows.
         self.showMaximized()
 
+    # -----------------------------
+    # Public UI methods (controller calls these)
+    # -----------------------------
+    def begin_scan_ui(self):
+        self.clear_cards()
+        self.set_status("Scanning...")
+        self.search_btn.setEnabled(False)
+
+    def end_scan_ui(self):
+        self.search_btn.setEnabled(True)
+
+    def set_status(self, text: str):
+        self.status_lbl.setText(text)
+
+    def set_devices(self, devices: List[DeviceInfo]):
+        self._layout_cards(devices)
+
+    def clear_cards(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+
+        self.cards = []
+        self.selected_macs.clear()
+        self._update_play_state()
+
+    def set_wearing_status(self, mac: str, is_wearing: bool):
+        for c in self.cards:
+            if c.device and c.device.mac == mac:
+                c.set_wearing_status(is_wearing)
+                break
+
+    # -----------------------------
+    # Internal UI slots
+    # -----------------------------
+    def _on_search_clicked(self):
+        # Clear immediately, then hand control to hooks
+        self.begin_scan_ui()
+        self.searchRequested.emit()
+
+    def _on_play_clicked(self):
+        macs = sorted(self.selected_macs)
+        self.playRequested.emit(macs)
+
+    # -----------------------------
+    # Card management + dynamic layout
+    # -----------------------------
+    def _layout_cards(self, devices: List[DeviceInfo]):
+        self.clear_cards()
+
+        n = min(len(devices), 4)
+        devices = devices[:n]
+
+        palette = ["#60A5FA", "#34D399", "#FBBF24", "#F472B6"]
+
+        for r in range(2):
+            self.grid.setRowStretch(r, 1)
+        for c in range(2):
+            self.grid.setColumnStretch(c, 1)
+
+        def add_card(i: int, dev: DeviceInfo) -> PlayerCard:
+            card = PlayerCard(self.ui_scale)
+            card.set_device(dev, palette[i % len(palette)])
+            card.toggled.connect(self._on_card_toggled)
+            self.cards.append(card)
+            return card
+
+        if n == 1:
+            self.grid.addWidget(add_card(0, devices[0]), 0, 0, 2, 2)
+        elif n == 2:
+            self.grid.addWidget(add_card(0, devices[0]), 0, 0)
+            self.grid.addWidget(add_card(1, devices[1]), 0, 1)
+        elif n == 3:
+            self.grid.addWidget(add_card(0, devices[0]), 0, 0)
+            self.grid.addWidget(add_card(1, devices[1]), 0, 1)
+            self.grid.addWidget(add_card(2, devices[2]), 1, 0, 1, 2)
+        else:
+            self.grid.addWidget(add_card(0, devices[0]), 0, 0)
+            self.grid.addWidget(add_card(1, devices[1]), 0, 1)
+            self.grid.addWidget(add_card(2, devices[2]), 1, 0)
+            self.grid.addWidget(add_card(3, devices[3]), 1, 1)
+
+        self._update_play_state()
+
+    def _on_card_toggled(self, card: PlayerCard):
+        if not card.device:
+            return
+        mac = card.device.mac
+
+        if card.selected:
+            self.selected_macs.add(mac)
+        else:
+            self.selected_macs.discard(mac)
+
+        self._update_play_state()
+        self.deviceToggled.emit(mac, card.selected)
+
+    def _update_play_state(self):
+        self.play_btn.setEnabled(len(self.selected_macs) > 0)
+
+    # -----------------------------
+    # Styling + logo
+    # -----------------------------
     def _load_logo(self, path: str):
         pix = QPixmap(path)
         if pix.isNull():
-            # fallback: show company name if file missing
             self.logo_lbl.setText("Niantong")
             fallback_font = QFont()
             fallback_font.setPointSize(max(12, int(16 * self.ui_scale)))
@@ -321,14 +423,12 @@ class IFocusWindow(QMainWindow):
             self.logo_lbl.setFont(fallback_font)
             return
 
-        # Scale logo to a sensible size relative to screen
         target_h = int(56 * self.ui_scale)
         scaled = pix.scaledToHeight(target_h, Qt.SmoothTransformation)
         self.logo_lbl.setPixmap(scaled)
         self.logo_lbl.setFixedSize(scaled.size())
 
     def _apply_styles(self):
-        # Sizes derived from scale for responsiveness
         search_pad_v = int(10 * self.ui_scale)
         search_pad_h = int(22 * self.ui_scale)
         play_pad_v = int(16 * self.ui_scale)
@@ -396,7 +496,30 @@ class IFocusWindow(QMainWindow):
                 border: 1px solid #007AFF;
             }}
 
-            QLabel#NameLabel {{ color: #111827; }}
+            QLineEdit#NameEdit {{
+                background: transparent;
+                color: #111827;
+                border: none;
+                border-bottom: 1px solid #E5E7EB;
+                padding: {int(4 * self.ui_scale)}px {int(8 * self.ui_scale)}px;
+                font-size: {max(12, int(16 * self.ui_scale))}px;
+                font-weight: 700;
+            }}
+            QLineEdit#NameEdit:focus {{
+                border-bottom: 2px solid #007AFF;
+            }}
+
+            QLabel#WearingIndicator {{
+                border-radius: {int(6 * self.ui_scale)}px;
+            }}
+            QLabel#WearingIndicator[wearing="good"] {{
+                background: #34C759;
+            }}
+            QLabel#WearingIndicator[wearing="bad"] {{
+                background: #FF3B30;
+            }}
+
+            QLabel#WearingText {{ color: #6B7280; }}
             QLabel#MetaLabel {{ color: #6B7280; }}
 
             QLabel#Pill {{
@@ -407,105 +530,3 @@ class IFocusWindow(QMainWindow):
             }}
             """
         )
-
-    # -----------------------------
-    # Card management + dynamic layout
-    # -----------------------------
-    def _clear_cards(self):
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            w = item.widget()
-            if w:
-                w.setParent(None)
-
-        self.cards = []
-        self.selected_macs.clear()
-        self._update_play_state()
-
-    def _layout_cards(self, devices: List[DeviceInfo]):
-        self._clear_cards()
-
-        n = min(len(devices), 4)
-        devices = devices[:n]
-
-        palette = ["#60A5FA", "#34D399", "#FBBF24", "#F472B6"]
-
-        # Stretch so cards expand with window
-        for r in range(3):
-            self.grid.setRowStretch(r, 1)
-        for c in range(2):
-            self.grid.setColumnStretch(c, 1)
-
-        def add_card(i: int, dev: DeviceInfo) -> PlayerCard:
-            card = PlayerCard(self.ui_scale)
-            card.set_device(dev, palette[i % len(palette)])
-            card.toggled.connect(self.on_card_toggled)
-            self.cards.append(card)
-            return card
-
-        if n == 1:
-            self.grid.addWidget(add_card(0, devices[0]), 0, 0, 2, 2)
-        elif n == 2:
-            self.grid.addWidget(add_card(0, devices[0]), 0, 0, 1, 1)
-            self.grid.addWidget(add_card(1, devices[1]), 0, 1, 1, 1)
-        elif n == 3:
-            self.grid.addWidget(add_card(0, devices[0]), 0, 0, 1, 1)
-            self.grid.addWidget(add_card(1, devices[1]), 0, 1, 1, 1)
-            self.grid.addWidget(add_card(2, devices[2]), 1, 0, 1, 2)
-        else:
-            self.grid.addWidget(add_card(0, devices[0]), 0, 0, 1, 1)
-            self.grid.addWidget(add_card(1, devices[1]), 0, 1, 1, 1)
-            self.grid.addWidget(add_card(2, devices[2]), 1, 0, 1, 1)
-            self.grid.addWidget(add_card(3, devices[3]), 1, 1, 1, 1)
-
-        self._update_play_state()
-
-    # -----------------------------
-    # Events
-    # -----------------------------
-    def on_search(self):
-        self._clear_cards()  # clear immediately per your requirement
-        self.status_lbl.setText("Scanning...")
-        self.search_btn.setEnabled(False)
-
-        QTimer.singleShot(450, self._finish_scan)
-
-    def _finish_scan(self):
-        found = scan_devices_stub()
-        devices = [DeviceInfo(d["name"], d["mac"], d["rssi"]) for d in found][:4]
-
-        if not devices:
-            self.status_lbl.setText("No devices found. Try Search again.")
-        else:
-            self.status_lbl.setText(f"Found {len(devices)} device(s). Tap to connect.")
-            self._layout_cards(devices)
-
-        self.search_btn.setEnabled(True)
-
-    def on_card_toggled(self, card: PlayerCard):
-        if not card.device:
-            return
-
-        mac = card.device.mac
-        if card.selected:
-            self.selected_macs.add(mac)
-            connect_device_stub(mac)
-        else:
-            self.selected_macs.discard(mac)
-            disconnect_device_stub(mac)
-
-        self._update_play_state()
-
-    def _update_play_state(self):
-        self.play_btn.setEnabled(len(self.selected_macs) > 0)
-
-    def on_play(self):
-        macs = sorted(self.selected_macs)
-        print("[PLAY] Connected MACs:", macs)
-        self.status_lbl.setText(f"Ready: {len(macs)} player(s) connected.")
-
-
-if __name__ == "__main__":
-    app = QApplication([])
-    win = IFocusWindow()
-    app.exec()
