@@ -1,0 +1,4 @@
+*.pyc
+__pycache__/
+.vscode/
+ifocus_sdk/APIs/__pycache__/

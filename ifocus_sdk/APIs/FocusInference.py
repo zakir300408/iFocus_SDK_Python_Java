@@ -20,8 +20,13 @@ from ._preprocess_extract_features import extract_features
 
 logger = logging.getLogger(__name__)
 
-_inference_task: Optional[asyncio.Task] = None
-_stop_event: Optional[asyncio.Event] = None
+_inference_tasks: dict[str, asyncio.Task] = {}
+_stop_events: dict[str, asyncio.Event] = {}
+
+
+def _session_key(subject_id: str, client) -> str:
+    addr = getattr(client, "address", None)
+    return f"{subject_id}:{addr or id(client)}"
 
 
 def _load_model(subject_id: str) -> dict:
@@ -157,36 +162,61 @@ async def startFocusInference(
     Returns:
         True if started successfully.
     """
-    global _inference_task, _stop_event
-    
-    if _inference_task and not _inference_task.done():
-        raise RuntimeError("Inference already running.")
+    global _inference_tasks, _stop_events
+
     if updateHz <= 0:
         raise ValueError("updateHz must be > 0")
     if client is None:
         raise ValueError("client is required")
+
+    key = _session_key(subjectId, client)
+    existing = _inference_tasks.get(key)
+    if existing and not existing.done():
+        raise RuntimeError("Inference already running for this subject/client.")
     
     _load_model(subjectId)
     
-    _stop_event = asyncio.Event()
-    _inference_task = asyncio.create_task(
-        _inference_loop(subjectId, client, updateHz, callback, _stop_event)
+    stop_event = asyncio.Event()
+    _stop_events[key] = stop_event
+    _inference_tasks[key] = asyncio.create_task(
+        _inference_loop(subjectId, client, updateHz, callback, stop_event)
     )
     return True
 
 
-async def stopFocusInference() -> None:
-    """Stop live focus inference."""
-    global _inference_task, _stop_event
-    
-    if _inference_task is None:
-        return
-    
-    if _stop_event:
-        _stop_event.set()
-    
-    try:
-        await _inference_task
-    finally:
-        _inference_task = None
-        _stop_event = None
+async def stopFocusInference(subjectId: Optional[str] = None, client=None) -> None:
+    """Stop live focus inference.
+
+    Args:
+        subjectId: If provided, stops sessions for this subject.
+        client: If provided (optionally with subjectId), stops sessions for this client.
+        If neither provided, stops all running inference sessions.
+    """
+    global _inference_tasks, _stop_events
+
+    keys = list(_inference_tasks.keys())
+    if subjectId is not None or client is not None:
+        addr = getattr(client, "address", None) if client is not None else None
+
+        def match(k: str) -> bool:
+            subj, _, rest = k.partition(":")
+            if subjectId is not None and subj != subjectId:
+                return False
+            if addr is not None and rest != str(addr):
+                return False
+            return True
+
+        keys = [k for k in keys if match(k)]
+
+    for k in keys:
+        ev = _stop_events.get(k)
+        if ev:
+            ev.set()
+
+    tasks = [t for k, t in _inference_tasks.items() if k in keys]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    for k in keys:
+        _inference_tasks.pop(k, None)
+        _stop_events.pop(k, None)

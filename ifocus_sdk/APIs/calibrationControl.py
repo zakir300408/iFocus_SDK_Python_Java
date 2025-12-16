@@ -19,6 +19,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from bleak import BleakClient, BleakScanner
+
 from .iFocusParser import Parser
 from .FocusComs import connect, disconnect, _get_client
 
@@ -253,7 +255,107 @@ _manager: Optional[_CalibrationManager] = None
 _streaming = False
 _connected = False
 _device_id: Optional[str] = None
+_clients: Dict[str, BleakClient] = {}
+_multi_parsers: Dict[str, Parser] = {}
+_multi_streaming: Dict[str, bool] = defaultdict(bool)
+_device_subject: Dict[str, str] = {}
+_subject_managers: Dict[str, _CalibrationManager] = {}
 _wearing_check_enabled = True  # Developer override flag
+
+
+def _is_device_list(deviceId) -> bool:
+    return isinstance(deviceId, (list, tuple, set))
+
+
+def _is_subject_list(subjectId) -> bool:
+    return isinstance(subjectId, (list, tuple))
+
+
+def _device_for_subject(subject_id: str) -> Optional[str]:
+    for did, sid in _device_subject.items():
+        if sid == subject_id:
+            return did
+    return None
+
+
+async def _scan_ifocus_devices(timeout_s: float = 3.0) -> List[tuple[str, str, int]]:
+    """Scan for iFocus devices and return list of (device_id, name, rssi) sorted by RSSI desc."""
+    found: Dict[str, tuple[str, int]] = {}
+
+    def on_device(device, adv_data):
+        name = device.name or getattr(adv_data, "local_name", None) or ""
+        if not name.startswith("iFocus"):
+            return
+
+        rssi = getattr(adv_data, "rssi", None) or getattr(device, "rssi", None)
+        rssi_int = int(rssi) if rssi is not None else -999
+
+        prev = found.get(device.address)
+        if prev is None or rssi_int > prev[1]:
+            found[device.address] = (name, rssi_int)
+
+    scanner = BleakScanner(detection_callback=on_device)
+    await scanner.start()
+    try:
+        await asyncio.sleep(timeout_s)
+    finally:
+        await scanner.stop()
+
+    results = [(addr, name, rssi) for addr, (name, rssi) in found.items()]
+    results.sort(key=lambda x: x[2], reverse=True)
+    return results
+
+
+async def _connect_multi(device_ids: List[str]) -> bool:
+    async def connect_one(did: str) -> bool:
+        if did in _clients and _clients[did].is_connected:
+            return True
+        client = BleakClient(did)
+        try:
+            await client.connect()
+            if client.is_connected:
+                _clients[did] = client
+                return True
+        except Exception as e:
+            logger.debug("Connection failed: %s", e)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return False
+
+    results = await asyncio.gather(*(connect_one(d) for d in device_ids))
+    return all(results)
+
+
+async def _disconnect_multi(device_ids: Optional[List[str]]) -> None:
+    ids = list(_clients.keys()) if device_ids is None else list(device_ids)
+
+    async def disconnect_one(did: str) -> None:
+        client = _clients.get(did)
+        if client is None:
+            return
+        try:
+            if client.is_connected:
+                if _multi_streaming.get(did, False):
+                    try:
+                        await client.stop_notify(DATA_CHAR_UUID)
+                    except Exception:
+                        pass
+                    _multi_streaming[did] = False
+                try:
+                    await client.write_gatt_char(COMMAND_CHAR_UUID, b"\x02", response=True)
+                except Exception:
+                    pass
+                await client.disconnect()
+        except Exception:
+            pass
+        finally:
+            _clients.pop(did, None)
+            _multi_parsers.pop(did, None)
+            _device_subject.pop(did, None)
+
+    await asyncio.gather(*(disconnect_one(d) for d in ids))
 
 
 def _get_manager() -> _CalibrationManager:
@@ -261,6 +363,39 @@ def _get_manager() -> _CalibrationManager:
     if _manager is None:
         _manager = _CalibrationManager()
     return _manager
+
+
+def _get_subject_manager(subject_id: str) -> _CalibrationManager:
+    mgr = _subject_managers.get(subject_id)
+    if mgr is None:
+        mgr = _CalibrationManager()
+        _subject_managers[subject_id] = mgr
+    return mgr
+
+
+def _get_multi_parser(device_id: str) -> Parser:
+    parser = _multi_parsers.get(device_id)
+    if parser is None:
+        parser = Parser()
+        _multi_parsers[device_id] = parser
+    return parser
+
+
+def _make_multi_notification_handler(device_id: str):
+    parser = _get_multi_parser(device_id)
+
+    def handler(_, data: bytes) -> None:
+        frames = parser.parse_data(data)
+        if not frames:
+            return
+
+        subject_id = _device_subject.get(device_id)
+        if not subject_id:
+            return
+
+        _get_subject_manager(subject_id).on_frames(_transform_frames(frames), parser.wearing_status)
+
+    return handler
 
 
 def _transform_frames(raw_frames: List[list]) -> List[Frame]:
@@ -288,11 +423,12 @@ def _notification_handler(_, data: bytes) -> None:
 
 async def calibrationControl(
     action: str,
-    deviceId: Optional[str] = None,
+    deviceId: Optional[str | list[str] | tuple[str, ...]] = None,
     subjectId: Optional[str] = None,
     stateLabel: Optional[str] = None,
-    outputDir: Optional[str | Path] = None
-) -> bool | List[Segment] | Optional[Path]:
+    outputDir: Optional[str | Path] = None,
+    nDevices: int = 1,
+) -> bool | List[Segment] | Optional[Path] | BleakClient | None:
     """Unified calibration control API.
     
     Args:
@@ -315,9 +451,49 @@ async def calibrationControl(
     _client = _get_client()
     
     # Validate parameters
-    _validate_action_params(action, deviceId, subjectId, stateLabel)
+    _validate_action_params(action, deviceId, subjectId, stateLabel, nDevices)
     
     if action == 'connect':
+        # If deviceId is omitted, scan and connect to the strongest nDevices.
+        if deviceId is None:
+            devices = await _scan_ifocus_devices(timeout_s=3.0)
+            target = devices[: max(0, nDevices)]
+            target_ids = [d[0] for d in target]
+            if len(target_ids) < max(0, nDevices):
+                return False
+
+            # If subjectId is provided as a list/tuple, bind each device to a subject.
+            if _is_subject_list(subjectId):
+                subject_ids = list(subjectId)
+                if len(subject_ids) != len(target_ids):
+                    raise ValueError("When subjectId is a list, it must match nDevices")
+                for did, sid in zip(target_ids, subject_ids):
+                    _device_subject[did] = str(sid)
+
+            for i, (did, name, rssi) in enumerate(target, 1):
+                sid = _device_subject.get(did)
+                suffix = f" subject={sid}" if sid else ""
+                print(f"{i}) {name} {did} rssi={rssi}{suffix}")
+
+            # If connecting only one device, preserve the legacy single-device path
+            # so calibrationControl('start'/'stop') continues to work.
+            if nDevices <= 1:
+                deviceId = target_ids[0]
+            else:
+                return await _connect_multi(target_ids)
+
+        # Multi-device mode: accept a list/tuple of device ids, or allow connecting
+        # additional devices without dropping existing multi connections.
+        if _is_device_list(deviceId) or _clients:
+            device_ids = list(deviceId) if _is_device_list(deviceId) else [deviceId]
+            if _is_subject_list(subjectId):
+                subject_ids = list(subjectId)
+                if len(subject_ids) != len(device_ids):
+                    raise ValueError("When subjectId is a list, it must match deviceId list length")
+                for did, sid in zip(device_ids, subject_ids):
+                    _device_subject[str(did)] = str(sid)
+            return await _connect_multi(device_ids)
+
         if _connected:
             return True
         
@@ -339,6 +515,16 @@ async def calibrationControl(
         return False
     
     elif action == 'disconnect':
+        # Multi-device mode: disconnect selected devices or all if deviceId is None.
+        if _clients or _is_device_list(deviceId):
+            if deviceId is None:
+                await _disconnect_multi(None)
+            elif _is_device_list(deviceId):
+                await _disconnect_multi(list(deviceId))
+            else:
+                await _disconnect_multi([deviceId])
+            return True
+
         if _device_id:
             try:
                 await disconnect(_device_id)
@@ -350,6 +536,36 @@ async def calibrationControl(
         return True
     
     elif action == 'start':
+        if _clients:
+            if _is_device_list(deviceId):
+                raise ValueError("Multi-device 'start' requires a single deviceId")
+            if not subjectId or not stateLabel:
+                raise ValueError("'start' requires subjectId and stateLabel")
+
+            if deviceId is None:
+                deviceId = _device_for_subject(subjectId)
+            if not deviceId:
+                raise RuntimeError("Unknown device for subject. Provide deviceId or bind subjects during connect.")
+
+            client = _clients.get(str(deviceId))
+            if client is None or not client.is_connected:
+                raise RuntimeError("Not connected. Use 'connect' first.")
+
+            # Bind this device to a subject for routing notifications.
+            _device_subject[str(deviceId)] = subjectId
+
+            # Start streaming once per device.
+            if not _multi_streaming.get(str(deviceId), False):
+                try:
+                    await client.start_notify(DATA_CHAR_UUID, _make_multi_notification_handler(str(deviceId)))
+                    await client.write_gatt_char(COMMAND_CHAR_UUID, b"\x01", response=True)
+                    _multi_streaming[str(deviceId)] = True
+                except Exception as e:
+                    raise RuntimeError(f"Failed to start streaming: {e}") from e
+
+            _get_subject_manager(subjectId).start(subjectId, stateLabel)
+            return True
+
         if not _connected or not _client:
             raise RuntimeError("Not connected. Use 'connect' first.")
         
@@ -365,6 +581,38 @@ async def calibrationControl(
         return True
     
     elif action == 'stop':
+        if _clients:
+            if _is_device_list(deviceId):
+                raise ValueError("Multi-device 'stop' requires a single deviceId")
+
+            if deviceId is None and subjectId:
+                deviceId = _device_for_subject(subjectId)
+            if not deviceId:
+                raise ValueError("Multi-device 'stop' requires deviceId or subjectId")
+
+            did = str(deviceId)
+            subject_id = _device_subject.get(did)
+            if not subject_id:
+                return None
+
+            result = _get_subject_manager(subject_id).stop(Path(outputDir) if outputDir else None)
+
+            # Stop streaming for this device so other components (e.g. inference)
+            # can start their own notify loop cleanly.
+            client = _clients.get(did)
+            if client and client.is_connected and _multi_streaming.get(did, False):
+                try:
+                    await client.write_gatt_char(COMMAND_CHAR_UUID, b"\x02", response=True)
+                except Exception:
+                    pass
+                try:
+                    await client.stop_notify(DATA_CHAR_UUID)
+                except Exception:
+                    pass
+                _multi_streaming[did] = False
+
+            return result
+
         result = mgr.stop(Path(outputDir) if outputDir else None)
         
         if _streaming and _client and _client.is_connected:
@@ -379,6 +627,18 @@ async def calibrationControl(
     
     elif action == 'get':
         return mgr.get_data(subjectId, stateLabel)
+
+    elif action == 'client':
+        # Return the connected BleakClient.
+        # - Multi-device: requires subjectId or deviceId.
+        # - Single-device: returns the module-level client.
+        if _clients:
+            if deviceId is None and subjectId:
+                deviceId = _device_for_subject(subjectId)
+            if not deviceId:
+                return None
+            return _clients.get(str(deviceId))
+        return _get_client()
     
     elif action == 'reset':
         mgr.clear(subjectId)
@@ -387,17 +647,18 @@ async def calibrationControl(
     return False
 
 
-def _validate_action_params(action: str, deviceId, subjectId, stateLabel) -> None:
+def _validate_action_params(action: str, deviceId, subjectId, stateLabel, nDevices: int) -> None:
     """Validate parameters for calibrationControl actions."""
     if action == 'connect' and not deviceId:
-        raise ValueError("'connect' requires deviceId")
+        if nDevices is None or int(nDevices) < 1:
+            raise ValueError("'connect' requires deviceId or nDevices>=1")
     elif action == 'start' and (not subjectId or not stateLabel):
         raise ValueError("'start' requires subjectId and stateLabel")
     elif action == 'get' and (not subjectId or not stateLabel):
         raise ValueError("'get' requires subjectId and stateLabel")
     elif action == 'reset' and not subjectId:
         raise ValueError("'reset' requires subjectId")
-    elif action not in ('connect', 'disconnect', 'start', 'stop', 'get', 'reset'):
+    elif action not in ('connect', 'disconnect', 'start', 'stop', 'get', 'reset', 'client'):
         raise ValueError(f"Unknown action: {action}")
 
 
