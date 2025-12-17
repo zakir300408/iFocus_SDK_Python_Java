@@ -91,55 +91,59 @@ async def _inference_loop(
         warning_interval = 2.0
         was_wearing = True
         
-        async for chunk in iFocusRealTimeReader(client, chunk_sec=chunk_sec):
-            if stop_event.is_set():
-                break
-            
-            if chunk.size == 0:
-                continue
-            
-            is_wearing = getWearingStatus()
-            
-            if isWearingCheckEnabled() and not is_wearing:
-                current_time = time.time()
-                if current_time - last_wearing_warning_time >= warning_interval:
-                    logger.warning(
-                        "HEADSET NOT WORN - Electrodes have no contact. "
-                        "Predictions paused until headset is worn properly."
-                    )
-                    last_wearing_warning_time = current_time
-                was_wearing = False
-                continue
-            
-            if not was_wearing and is_wearing:
-                epoch_maker.reset()
-                logger.info("Headset worn again - cleared buffer, resuming predictions.")
-            was_wearing = True
-            
-            for epoch in epoch_maker.push(chunk):
-                feats = extract_features(epoch, fs=fs)
-                x = np.array([[feats[k] for k in feature_names]])
+        try:
+            async for chunk in iFocusRealTimeReader(client, chunk_sec=chunk_sec):
+                if stop_event.is_set():
+                    break
                 
-                if hasattr(model, "predict_proba"):
-                    proba = model.predict_proba(x)[0]
-                else:
-                    df = model.decision_function(x)
-                    df = np.vstack([-df, df]).T if df.ndim == 1 else df
-                    ex = np.exp(df - np.max(df))
-                    proba = (ex / np.sum(ex, axis=1, keepdims=True))[0]
+                if chunk.size == 0:
+                    continue
                 
-                try:
-                    label = str(model.predict(x)[0])
-                except Exception:
-                    label = str(classes[np.argmax(proba)]) if classes else "UNKNOWN"
+                is_wearing = getWearingStatus()
                 
-                strength = _compute_focus_strength(feats, proba, classes)
-                timestamp = datetime.now(timezone.utc).isoformat()
+                if isWearingCheckEnabled() and not is_wearing:
+                    current_time = time.time()
+                    if current_time - last_wearing_warning_time >= warning_interval:
+                        logger.warning(
+                            "HEADSET NOT WORN - Electrodes have no contact. "
+                            "Predictions paused until headset is worn properly."
+                        )
+                        last_wearing_warning_time = current_time
+                    was_wearing = False
+                    continue
                 
-                try:
-                    callback(label, strength, timestamp)
-                except Exception as e:
-                    logger.warning("Callback error: %s", e)
+                if not was_wearing and is_wearing:
+                    epoch_maker.reset()
+                    logger.info("Headset worn again - cleared buffer, resuming predictions.")
+                was_wearing = True
+                
+                for epoch in epoch_maker.push(chunk):
+                    feats = extract_features(epoch, fs=fs)
+                    x = np.array([[feats[k] for k in feature_names]])
+                    
+                    if hasattr(model, "predict_proba"):
+                        proba = model.predict_proba(x)[0]
+                    else:
+                        df = model.decision_function(x)
+                        df = np.vstack([-df, df]).T if df.ndim == 1 else df
+                        ex = np.exp(df - np.max(df))
+                        proba = (ex / np.sum(ex, axis=1, keepdims=True))[0]
+                    
+                    try:
+                        label = str(model.predict(x)[0])
+                    except Exception:
+                        label = str(classes[np.argmax(proba)]) if classes else "UNKNOWN"
+                    
+                    strength = _compute_focus_strength(feats, proba, classes)
+                    timestamp = datetime.now(timezone.utc).isoformat()
+                    
+                    try:
+                        callback(label, strength, timestamp)
+                    except Exception as e:
+                        logger.warning("Callback error: %s", e)
+        except GeneratorExit:
+            # Stop was requested while the generator was mid-iteration; just exit quietly
+            pass
     
     except Exception as e:
         logger.exception("Inference loop failed: %s", e)

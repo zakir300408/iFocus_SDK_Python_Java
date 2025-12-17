@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
+import threading
 from pathlib import Path
 import logging
 
@@ -9,6 +11,10 @@ import logging
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# On Windows, prefer selector loop to avoid qasync/proactor re-entrancy issues
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Import PySide6 before qasync to ensure correct Qt binding is detected
 from PySide6.QtWidgets import QApplication
@@ -33,6 +39,7 @@ import ifocus_2_player_game.ui.play_window_config as play_config
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
+logger.setLevel(logging.INFO)  # Keep main at INFO, but allow DEBUG from SDK
 
 class GameController:
     def __init__(self, window: IFocusWindow):
@@ -46,6 +53,10 @@ class GameController:
         
         # Keep track of connected devices
         self.connected_devices = set()
+        
+        # Disable wearing check for now to collect data even if headset shows not worn
+        logger.info("Disabling wearing check to allow data collection")
+        setWearingCheckEnabled(False)
 
     def start(self):
         self._status_task = asyncio.get_event_loop().create_task(self._update_status_loop())
@@ -95,7 +106,8 @@ class GameController:
                 self.window.set_status(f"Connecting to {mac}...")
                 self.window.set_connection_state(mac, "connecting")
                 
-                success = await calibrationControl('connect', deviceId=mac)
+                # Always use multi-device path and bind subject to MAC to keep routing consistent
+                success = await calibrationControl('connect', deviceId=[mac], subjectId=[mac])
                 if success:
                     self.window.set_status(f"Connected to {mac}")
                     self.window.set_connection_state(mac, "connected")
@@ -104,7 +116,8 @@ class GameController:
                     # Start streaming to get wearing status
                     # We use a dummy start to enable notifications
                     try:
-                        await calibrationControl('start', subjectId=mac, stateLabel='MONITOR')
+                        # Provide deviceId so multi-device manager can bind notifications immediately
+                        await calibrationControl('start', deviceId=mac, subjectId=mac, stateLabel='MONITOR')
                     except Exception as e:
                         logger.warning(f"Could not start monitoring for {mac}: {e}")
                         
@@ -137,13 +150,16 @@ class GameController:
                 logger.error(f"Status loop error: {e}")
                 await asyncio.sleep(1.0)
 
-    def on_play_requested(self, players_info: List[dict]):
+    def on_play_requested(self, players_info: list[dict]):
         self.window.hide()
         asyncio.create_task(self._run_game_sequence(players_info))
 
-    async def _run_game_sequence(self, players_info: List[dict]):
+    async def _run_game_sequence(self, players_info: list[dict]):
         macs = [p["mac"] for p in players_info]
         logger.info(f"Starting play sequence for {macs}")
+        
+        # Create mapping from MAC to player name for data collection
+        mac_to_name = {p["mac"]: p["name"] for p in players_info}
         
         # Setup players
         players = []
@@ -158,31 +174,51 @@ class GameController:
         game_state = {
             "strengths": [50] * len(macs),
             "wearing": [True] * len(macs),
-            "running": True
+            "running": True,
+            "stage": {
+                "id": "init",
+                "type": "RELAX",
+                "duration": 10
+            }
         }
 
-        # Helper to run a stage
-        async def run_stage(task_type, duration):
+        # Configure initial session config for the UI to pick up players
+        play_config.get_default_session_config = lambda: play_config.SessionConfig(
+            task_type="RELAX",
+            players=players,
+            duration_seconds=10
+        )
+        
+        # Start the pygame UI in its own event loop/thread to avoid re-entrancy with qasync/Qt
+        def _run_ui():
+            asyncio.run(play_ui.run_game_loop(game_state))
+
+        ui_thread = threading.Thread(target=_run_ui, daemon=True)
+        ui_thread.start()
+
+        async def run_stage_logic(task_type, duration):
             logger.info(f"Starting stage: {task_type}")
             
-            # Configure session
-            play_config.get_default_session_config = lambda: play_config.SessionConfig(
-                task_type=task_type,
-                players=players,
-                duration_seconds=duration
-            )
+            # Update game state to trigger UI transition
+            game_state["stage"] = {
+                "id": f"{task_type}_{time.time()}",
+                "type": task_type,
+                "duration": duration
+            }
             
-            # Start data collection
+            # Start data collection using player names as subjectId
             for mac in macs:
-                await calibrationControl('start', subjectId=mac, stateLabel=task_type)
+                player_name = mac_to_name[mac]
+                logger.info(f"Starting data collection for {player_name} (device {mac}) - {task_type}")
+                await calibrationControl('start', deviceId=mac, subjectId=player_name, stateLabel=task_type)
             
-            # Run UI with shared state
-            # We need to run the game loop and a background task to update state simultaneously
-            game_task = asyncio.create_task(play_ui.run_game_loop(game_state))
-            
-            # Monitor loop for this stage
-            start_time = asyncio.get_event_loop().time()
-            while not game_task.done():
+            # Wait for duration
+            end_time = asyncio.get_event_loop().time() + duration
+            while asyncio.get_event_loop().time() < end_time:
+                if not ui_thread.is_alive():
+                    logger.warning("UI closed unexpectedly")
+                    break
+                
                 # Update wearing status
                 current_wearing = []
                 for mac in macs:
@@ -193,59 +229,149 @@ class GameController:
                         current_wearing.append(False)
                 game_state["wearing"] = current_wearing
                 
-                # If we are in LIVE mode, we might want to update strengths from inference
-                # But inference is callback based. We'll handle that separately.
-                
+                await asyncio.sleep(0.1)
+            
+            # Stop data collection using player names
+            for mac in macs:
+                player_name = mac_to_name[mac]
+                result = await calibrationControl('stop', deviceId=mac, subjectId=player_name)
+                logger.info(f"Stopped data collection for {player_name}: {result}")
+
+        async def run_live_stage(duration):
+            """Live stage driven only by inference (no extra recording)."""
+            task_type = "LIVE"
+            logger.info(f"Starting stage: {task_type}")
+
+            game_state["stage"] = {
+                "id": f"{task_type}_{time.time()}",
+                "type": task_type,
+                "duration": duration
+            }
+
+            end_time = asyncio.get_event_loop().time() + duration
+            while asyncio.get_event_loop().time() < end_time:
+                if not ui_thread.is_alive():
+                    logger.warning("UI closed unexpectedly")
+                    break
+
+                current_wearing = []
+                for mac in macs:
+                    parser = _multi_parsers.get(mac)
+                    if parser:
+                        current_wearing.append(parser.wearing_status)
+                    else:
+                        current_wearing.append(False)
+                game_state["wearing"] = current_wearing
+
                 await asyncio.sleep(0.1)
 
-            await game_task
-            
-            # Stop data collection
+        async def run_inference_session(calibrate: bool, live_duration: int = 60):
+            """Optionally recalibrate/train, then run inference + live stage."""
+
+            if calibrate:
+                await run_stage_logic("RELAX", 10)
+                await run_stage_logic("FOCUS", 10)
+
+                logger.info("Training models...")
+                from ifocus_sdk.APIs.trainFocusModel import trainFocusModel
+
+                for mac in macs:
+                    player_name = mac_to_name[mac]
+                    def cb(success, msg, n):
+                        logger.info(f"[{player_name}] Training: {msg}")
+                    trainFocusModel(player_name, cb)
+
+            # Start Inference
+            logger.info("Starting Inference...")
+            from ifocus_sdk.APIs.FocusInference import startFocusInference, stopFocusInference
+
+            mac_to_idx = {mac: i for i, mac in enumerate(macs)}
+            inference_tasks = []
             for mac in macs:
-                await calibrationControl('stop', deviceId=mac)
+                client = await calibrationControl('client', deviceId=mac)
+                if client:
+                    idx = mac_to_idx[mac]
+                    player_name = mac_to_name[mac]
 
-        # 1. Relax
-        await run_stage("RELAX", 10)
-        
-        # 2. Focus
-        await run_stage("FOCUS", 10)
-        
-        # 3. Live Play
-        logger.info("Training models...")
-        from ifocus_sdk.APIs.trainFocusModel import trainFocusModel
-        
-        # We can show a "Training..." status on the UI if we had a loading screen,
-        # but for now we just log it.
-        for mac in macs:
-            def cb(success, msg, n):
-                logger.info(f"[{mac}] Training: {msg}")
-            trainFocusModel(mac, cb)
-            
-        # Start Inference
-        logger.info("Starting Inference...")
-        from ifocus_sdk.APIs.FocusInference import startFocusInference, stopFocusInference
-        
-        # Map mac to player index for callback
-        mac_to_idx = {mac: i for i, mac in enumerate(macs)}
-        
-        def inference_callback(mac, score):
-            if mac in mac_to_idx:
-                idx = mac_to_idx[mac]
-                # Score is 0-100
-                game_state["strengths"][idx] = int(score)
-                # logger.info(f"Inference {mac}: {score}")
+                    def make_callback(device_idx):
+                        def cb(label, strength, timestamp):
+                            game_state["strengths"][device_idx] = int(strength)
+                        return cb
 
-        for mac in macs:
-            startFocusInference(mac, inference_callback)
-        
+                    task = asyncio.create_task(
+                        startFocusInference(player_name, client, updateHz=2.0, callback=make_callback(idx))
+                    )
+                    inference_tasks.append((mac, player_name, client, task))
+
+            try:
+                await run_live_stage(live_duration)
+            finally:
+                for mac, player_name, client, task in inference_tasks:
+                    try:
+                        await stopFocusInference(subjectId=player_name, client=client)
+                    except Exception as e:
+                        logger.warning(f"stopFocusInference failed for {player_name}/{mac}: {e}")
+                for _, _, _, task in inference_tasks:
+                    if not task.done():
+                        task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        action = "start_fresh"
+        first_run = True
+
         try:
-            await run_stage("LIVE", 60)
+            while True:
+                calibrate = action == "start_fresh" or first_run
+                first_run = False
+
+                if action == "start_fresh" and not calibrate:
+                    # should not happen, but guard
+                    calibrate = True
+
+                if action == "start_fresh" and not first_run:
+                    # Wipe previous data/models when starting fresh after a round
+                    for mac in macs:
+                        player_name = mac_to_name[mac]
+                        try:
+                            await calibrationControl('reset', subjectId=player_name)
+                            logger.info(f"Cleared calibration/model data for {player_name}")
+                        except Exception as e:
+                            logger.warning(f"Reset failed for {player_name}: {e}")
+
+                # Run session (calibration+train+live or just live with existing model)
+                await run_inference_session(calibrate=calibrate, live_duration=60)
+
+                # Wait for user choice from UI (rematch or start fresh)
+                chosen = None
+                while chosen is None:
+                    if not ui_thread.is_alive():
+                        chosen = "quit"
+                        break
+                    chosen = game_state.get("action")
+                    if chosen is None:
+                        await asyncio.sleep(0.1)
+
+                game_state["action"] = None
+                action = chosen
+
+                if chosen == "rematch":
+                    # Replay live using existing models
+                    continue
+                elif chosen == "start_fresh":
+                    action = "start_fresh"
+                    continue
+                else:
+                    break
+
         finally:
-            for mac in macs:
-                stopFocusInference(mac)
-        
-        logger.info("Game sequence finished.")
-        self.window.show()
+            logger.info("Game sequence finished.")
+            game_state["running"] = False
+            if ui_thread.is_alive():
+                ui_thread.join(timeout=2.0)
+            self.window.show()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

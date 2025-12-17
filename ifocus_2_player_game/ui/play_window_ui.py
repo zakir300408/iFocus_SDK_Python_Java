@@ -189,7 +189,7 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     if not players:
         raise SystemExit("play_window_config must define at least one player.")
 
-    # Determine Game Mode Behavior
+    # Initial Game Mode Behavior (will be updated by game_state)
     task_type = session_cfg.task_type.upper()
     
     # Defaults for LIVE mode
@@ -198,16 +198,27 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     auto_exit_on_finish = False
     theme_color_override = None # None means use default logic or specific colors
     
-    if "RELAX" in task_type:
-        show_score = False
-        show_projectiles = False
-        auto_exit_on_finish = True
-        theme_color_override = (59, 130, 246) # Cool Blue
-    elif "FOCUS" in task_type:
-        show_score = False
-        show_projectiles = False
-        auto_exit_on_finish = True
-        theme_color_override = (249, 115, 22) # Warm Orange
+    def update_stage_config(new_task_type: str):
+        nonlocal show_score, show_projectiles, auto_exit_on_finish, theme_color_override, task_type
+        task_type = new_task_type.upper()
+        
+        if "RELAX" in task_type:
+            show_score = False
+            show_projectiles = False
+            auto_exit_on_finish = True
+            theme_color_override = (59, 130, 246) # Cool Blue
+        elif "FOCUS" in task_type:
+            show_score = False
+            show_projectiles = False
+            auto_exit_on_finish = True
+            theme_color_override = (249, 115, 22) # Warm Orange
+        else: # LIVE or default
+            show_score = True
+            show_projectiles = True
+            auto_exit_on_finish = False
+            theme_color_override = None
+
+    update_stage_config(task_type)
 
     # Load images
     background = load_image("skyblue.png")
@@ -255,29 +266,29 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     # Slightly smaller so they feel less punishing.
     proj_target_w = int(window_width * 0.07)
 
-    if show_projectiles:
-        if fireball_img is not None:
-            fireball_img = scale_to_width(fireball_img, proj_target_w)
-            projectile_types.append(
-                {"name": "fireball", "image": fireball_img, "speed": base_speed * 0.7}
-            )
-        if arrow_img is not None:
-            arrow_img = scale_to_width(arrow_img, proj_target_w)
-            projectile_types.append(
-                {"name": "arrow", "image": arrow_img, "speed": base_speed * 0.8}
-            )
-        if javelin_img is not None:
-            javelin_img = scale_to_width(javelin_img, proj_target_w)
-            projectile_types.append(
-                {"name": "javelin", "image": javelin_img, "speed": base_speed * 0.6}
-            )
-        if obstacle_img is not None:
-            obstacle_img = scale_to_width(obstacle_img, proj_target_w)
-            # Flip obstacles so they face toward the players
-            obstacle_img = pygame.transform.flip(obstacle_img, True, False)
-            projectile_types.append(
-                {"name": "obstacle", "image": obstacle_img, "speed": base_speed * 0.5}
-            )
+    # Always populate projectile_types so they're available when switching to LIVE stage
+    if fireball_img is not None:
+        fireball_img = scale_to_width(fireball_img, proj_target_w)
+        projectile_types.append(
+            {"name": "fireball", "image": fireball_img, "speed": base_speed * 0.7}
+        )
+    if arrow_img is not None:
+        arrow_img = scale_to_width(arrow_img, proj_target_w)
+        projectile_types.append(
+            {"name": "arrow", "image": arrow_img, "speed": base_speed * 0.8}
+        )
+    if javelin_img is not None:
+        javelin_img = scale_to_width(javelin_img, proj_target_w)
+        projectile_types.append(
+            {"name": "javelin", "image": javelin_img, "speed": base_speed * 0.6}
+        )
+    if obstacle_img is not None:
+        obstacle_img = scale_to_width(obstacle_img, proj_target_w)
+        # Flip obstacles so they face toward the players
+        obstacle_img = pygame.transform.flip(obstacle_img, True, False)
+        projectile_types.append(
+            {"name": "obstacle", "image": obstacle_img, "speed": base_speed * 0.5}
+        )
 
     # Simple cloud layers for parallax-like motion
     cloud_speed_1 = 40  # pixels / second
@@ -344,14 +355,61 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     winner_pulse_time = 0.0
     rematch_button_rect = None
     startfresh_button_rect = None
+    
+    current_stage_id = None
+
+    # Use asyncio sleep for timing to avoid blocking the event loop with clock.tick
+    target_frame_time = 1.0 / FPS
+    last_time = asyncio.get_event_loop().time()
+
     while running:
-        await asyncio.sleep(0)
-        dt = clock.tick(FPS) / 1000.0  # seconds since last frame
+        # Calculate dt using asyncio time
+        current_time = asyncio.get_event_loop().time()
+        dt = current_time - last_time
+        
+        # Cap dt to avoid huge jumps if lag occurs
+        if dt > 0.1:
+            dt = 0.1
+            
+        # Sleep to maintain FPS
+        sleep_time = target_frame_time - (asyncio.get_event_loop().time() - current_time)
+        if sleep_time > 0:
+            await asyncio.sleep(sleep_time)
+            # Update time after sleep
+            current_time = asyncio.get_event_loop().time()
+            dt = current_time - last_time
+            if dt > 0.1: dt = 0.1
+        else:
+            await asyncio.sleep(0) # Yield at least once
+            
+        last_time = current_time
 
         # Sync with external game_state if provided
         if game_state:
             if not game_state.get("running", True):
                 running = False
+            
+            # Check for stage transition
+            stage_info = game_state.get("stage")
+            if stage_info and stage_info.get("id") != current_stage_id:
+                current_stage_id = stage_info.get("id")
+                
+                # Update configuration
+                new_task_type = stage_info.get("type", "LIVE")
+                update_stage_config(new_task_type)
+                
+                # Reset round state
+                round_duration = max(1, stage_info.get("duration", 60))
+                time_remaining = float(round_duration)
+                second_accumulator = 0.0
+                
+                scores = [0 for _ in players]
+                hit_timers = [0.0 for _ in players]
+                projectiles.clear()
+                projectile_spawn_accumulator = 0.0
+                last_projectile_target_idx = None
+                winner_pulse_time = 0.0
+                state = "playing"
             
             # Update strengths safely
             ext_strengths = game_state.get("strengths", [])
@@ -364,31 +422,29 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                 local_wearing[i] = ext_wearing[i]
 
         # Event handling
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
+        # Process pygame events carefully to avoid interfering with Qt event loop
+        try:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
                     running = False
-                # Removed K_UP/K_DOWN manual control
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if state == "game_over":
-                    if rematch_button_rect and rematch_button_rect.collidepoint(event.pos):
-                        # Reset round state for a rematch with the same players
-                        # local_strengths = [50 for _ in players] # Don't reset strength, keep it live
-                        scores = [0 for _ in players]
-                        hit_timers = [0.0 for _ in players]
-                        time_remaining = float(round_duration)
-                        second_accumulator = 0.0
-                        projectiles.clear()
-                        projectile_spawn_accumulator = 0.0
-                        last_projectile_target_idx = None
-                        winner_pulse_time = 0.0
-                        state = "playing"
-                    elif startfresh_button_rect and startfresh_button_rect.collidepoint(event.pos):
-                        # Exit this play window; outer UI can start a new
-                        # session or configuration as needed.
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
                         running = False
+                    # Removed K_UP/K_DOWN manual control
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if state == "game_over":
+                        if rematch_button_rect and rematch_button_rect.collidepoint(event.pos):
+                            # Signal controller to rematch using existing models
+                            if game_state is not None:
+                                game_state["action"] = "rematch"
+                            state = "waiting_next_stage"
+                        elif startfresh_button_rect and startfresh_button_rect.collidepoint(event.pos):
+                            # Signal controller to wipe data and recalibrate
+                            if game_state is not None:
+                                game_state["action"] = "start_fresh"
+                            state = "waiting_next_stage"
+        except Exception:
+            pass  # Ignore event processing errors to avoid blocking
 
         # Timer and scoring: each full second that passes
         # awards +1 score point to every player while time remains.
@@ -404,7 +460,11 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
             if time_remaining <= 0:
                 time_remaining = 0
                 if auto_exit_on_finish:
-                    running = False # Exit loop immediately for calibration modes
+                    # If controlled externally, we don't want to exit the loop, just wait for next stage
+                    if game_state:
+                        state = "waiting_next_stage"
+                    else:
+                        running = False # Exit loop immediately for calibration modes
                 else:
                     state = "game_over"
                     winner_pulse_time = 0.0
@@ -612,21 +672,22 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
             screen.blit(proj["image"], proj["rect"])
 
         # Task type badge (top-center), color-coded
-        task_type = session_cfg.task_type.lower()
-        if "relax" in task_type:
+        # Use current task_type from the nonlocal variable which gets updated by stage transitions
+        current_task_type = task_type.lower()
+        if "relax" in current_task_type:
             task_label = "Relax"
             task_color = (59, 130, 246) # Cool Blue
-        elif "focus" in task_type:
+        elif "focus" in current_task_type:
             task_label = "Focus"
             task_color = (249, 115, 22) # Warm Orange
-        elif "training" in task_type:
+        elif "training" in current_task_type:
             task_label = "Training"
             task_color = (234, 179, 8)  # yellow
-        elif "live" in task_type:
+        elif "live" in current_task_type:
             task_label = "Live Play"
             task_color = (34, 197, 94)  # green
         else:
-            task_label = session_cfg.task_type
+            task_label = task_type
             task_color = (107, 114, 128)  # gray
 
         task_surf = task_font.render(task_label, True, (17, 24, 39))

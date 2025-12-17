@@ -158,6 +158,7 @@ class _CalibrationManager:
         """Start a new calibration session."""
         if self._session:
             self.stop()  # Finalize previous without saving
+        logger.info(f"CalibrationManager.start() called: subject_id='{subject_id}', state_label='{state_label}'")
         self._session = (subject_id, state_label, [])
         self._was_wearing = True  # Reset wearing state on new session
         self._last_warning_time = 0
@@ -391,9 +392,15 @@ def _make_multi_notification_handler(device_id: str):
 
         subject_id = _device_subject.get(device_id)
         if not subject_id:
+            logger.warning(f"No subject bound to device {device_id}. Current bindings: {_device_subject}")
             return
-
-        _get_subject_manager(subject_id).on_frames(_transform_frames(frames), parser.wearing_status)
+        
+        try:
+            logger.debug(f"Routing {len(frames)} frames from device {device_id} to subject '{subject_id}'")
+            _get_subject_manager(subject_id).on_frames(_transform_frames(frames), parser.wearing_status)
+        except GeneratorExit:
+            # If loop is shutting down while notifications still arrive, just drop the frames
+            pass
 
     return handler
 
@@ -552,7 +559,10 @@ async def calibrationControl(
                 raise RuntimeError("Not connected. Use 'connect' first.")
 
             # Bind this device to a subject for routing notifications.
+            logger.info(f"START action: deviceId={deviceId}, subjectId={subjectId}, stateLabel={stateLabel}")
+            logger.info(f"Before binding - _device_subject: {_device_subject}")
             _device_subject[str(deviceId)] = subjectId
+            logger.info(f"After binding - _device_subject: {_device_subject}")
 
             # Start streaming once per device.
             if not _multi_streaming.get(str(deviceId), False):
@@ -564,6 +574,7 @@ async def calibrationControl(
                     raise RuntimeError(f"Failed to start streaming: {e}") from e
 
             _get_subject_manager(subjectId).start(subjectId, stateLabel)
+            logger.info(f"Started session for subject '{subjectId}' with label '{stateLabel}' on device {deviceId}")
             return True
 
         if not _connected or not _client:
@@ -591,9 +602,17 @@ async def calibrationControl(
                 raise ValueError("Multi-device 'stop' requires deviceId or subjectId")
 
             did = str(deviceId)
-            subject_id = _device_subject.get(did)
+            
+            # Use passed subjectId if provided, otherwise look up from binding
+            if subjectId:
+                subject_id = subjectId
+            else:
+                subject_id = _device_subject.get(did)
+            
             if not subject_id:
                 return None
+            
+            logger.info(f"Stopping data collection for device {did}, subject '{subject_id}'. Bindings: {_device_subject}")
 
             result = _get_subject_manager(subject_id).stop(Path(outputDir) if outputDir else None)
 
