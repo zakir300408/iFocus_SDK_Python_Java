@@ -2,10 +2,15 @@ import sys
 from pathlib import Path
 import math
 import random
+import asyncio
+from typing import Optional, Dict, Any, List
 
 import pygame
 
-import play_window_config
+try:
+    import play_window_config
+except ImportError:
+    from . import play_window_config
 
 
 # -----------------------------
@@ -146,7 +151,17 @@ def map_strength_to_y(
     return y
 
 
-def main() -> None:
+async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Main game loop.
+    
+    Args:
+        game_state: Optional dictionary to share state with the controller.
+                    Expected keys:
+                    - 'strengths': List[int] (0-100)
+                    - 'wearing': List[bool]
+                    - 'running': bool (set to False to stop loop)
+    """
     pygame.init()
     pygame.display.set_caption("iFocus Play Window")
 
@@ -173,6 +188,26 @@ def main() -> None:
     players = session_cfg.players
     if not players:
         raise SystemExit("play_window_config must define at least one player.")
+
+    # Determine Game Mode Behavior
+    task_type = session_cfg.task_type.upper()
+    
+    # Defaults for LIVE mode
+    show_score = True
+    show_projectiles = True
+    auto_exit_on_finish = False
+    theme_color_override = None # None means use default logic or specific colors
+    
+    if "RELAX" in task_type:
+        show_score = False
+        show_projectiles = False
+        auto_exit_on_finish = True
+        theme_color_override = (59, 130, 246) # Cool Blue
+    elif "FOCUS" in task_type:
+        show_score = False
+        show_projectiles = False
+        auto_exit_on_finish = True
+        theme_color_override = (249, 115, 22) # Warm Orange
 
     # Load images
     background = load_image("skyblue.png")
@@ -220,28 +255,29 @@ def main() -> None:
     # Slightly smaller so they feel less punishing.
     proj_target_w = int(window_width * 0.07)
 
-    if fireball_img is not None:
-        fireball_img = scale_to_width(fireball_img, proj_target_w)
-        projectile_types.append(
-            {"name": "fireball", "image": fireball_img, "speed": base_speed * 0.7}
-        )
-    if arrow_img is not None:
-        arrow_img = scale_to_width(arrow_img, proj_target_w)
-        projectile_types.append(
-            {"name": "arrow", "image": arrow_img, "speed": base_speed * 0.8}
-        )
-    if javelin_img is not None:
-        javelin_img = scale_to_width(javelin_img, proj_target_w)
-        projectile_types.append(
-            {"name": "javelin", "image": javelin_img, "speed": base_speed * 0.6}
-        )
-    if obstacle_img is not None:
-        obstacle_img = scale_to_width(obstacle_img, proj_target_w)
-        # Flip obstacles so they face toward the players
-        obstacle_img = pygame.transform.flip(obstacle_img, True, False)
-        projectile_types.append(
-            {"name": "obstacle", "image": obstacle_img, "speed": base_speed * 0.5}
-        )
+    if show_projectiles:
+        if fireball_img is not None:
+            fireball_img = scale_to_width(fireball_img, proj_target_w)
+            projectile_types.append(
+                {"name": "fireball", "image": fireball_img, "speed": base_speed * 0.7}
+            )
+        if arrow_img is not None:
+            arrow_img = scale_to_width(arrow_img, proj_target_w)
+            projectile_types.append(
+                {"name": "arrow", "image": arrow_img, "speed": base_speed * 0.8}
+            )
+        if javelin_img is not None:
+            javelin_img = scale_to_width(javelin_img, proj_target_w)
+            projectile_types.append(
+                {"name": "javelin", "image": javelin_img, "speed": base_speed * 0.6}
+            )
+        if obstacle_img is not None:
+            obstacle_img = scale_to_width(obstacle_img, proj_target_w)
+            # Flip obstacles so they face toward the players
+            obstacle_img = pygame.transform.flip(obstacle_img, True, False)
+            projectile_types.append(
+                {"name": "obstacle", "image": obstacle_img, "speed": base_speed * 0.5}
+            )
 
     # Simple cloud layers for parallax-like motion
     cloud_speed_1 = 40  # pixels / second
@@ -254,7 +290,10 @@ def main() -> None:
     cloud2_y = window_height * 0.32
 
     # Character strengths and scores (one per configured player)
-    strengths = [50 for _ in players]
+    # Local state (fallback if game_state not provided)
+    local_strengths = [50 for _ in players]
+    local_wearing = [True for _ in players]
+    
     scores = [0 for _ in players]
     hit_timers = [0.0 for _ in players]
 
@@ -283,6 +322,9 @@ def main() -> None:
     # Helper: map strength (0-100) to a warm "temperature" color.
     # 0   -> relaxed (cool color), 50 -> mid, 100 -> focused (orangish).
     def strength_to_color(value: int) -> tuple[int, int, int]:
+        if theme_color_override:
+            return theme_color_override
+            
         value = max(MIN_STRENGTH, min(MAX_STRENGTH, value))
         t = value / float(MAX_STRENGTH or 1)
 
@@ -303,7 +345,23 @@ def main() -> None:
     rematch_button_rect = None
     startfresh_button_rect = None
     while running:
+        await asyncio.sleep(0)
         dt = clock.tick(FPS) / 1000.0  # seconds since last frame
+
+        # Sync with external game_state if provided
+        if game_state:
+            if not game_state.get("running", True):
+                running = False
+            
+            # Update strengths safely
+            ext_strengths = game_state.get("strengths", [])
+            for i in range(min(len(local_strengths), len(ext_strengths))):
+                local_strengths[i] = ext_strengths[i]
+                
+            # Update wearing safely
+            ext_wearing = game_state.get("wearing", [])
+            for i in range(min(len(local_wearing), len(ext_wearing))):
+                local_wearing[i] = ext_wearing[i]
 
         # Event handling
         for event in pygame.event.get():
@@ -312,19 +370,12 @@ def main() -> None:
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
-                elif event.key == pygame.K_UP and state == "playing":
-                    strengths = [
-                        min(MAX_STRENGTH, s + STRENGTH_STEP) for s in strengths
-                    ]
-                elif event.key == pygame.K_DOWN and state == "playing":
-                    strengths = [
-                        max(MIN_STRENGTH, s - STRENGTH_STEP) for s in strengths
-                    ]
+                # Removed K_UP/K_DOWN manual control
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if state == "game_over":
                     if rematch_button_rect and rematch_button_rect.collidepoint(event.pos):
                         # Reset round state for a rematch with the same players
-                        strengths = [50 for _ in players]
+                        # local_strengths = [50 for _ in players] # Don't reset strength, keep it live
                         scores = [0 for _ in players]
                         hit_timers = [0.0 for _ in players]
                         time_remaining = float(round_duration)
@@ -346,13 +397,17 @@ def main() -> None:
             second_accumulator += dt
             while second_accumulator >= 1.0 and time_remaining > 0:
                 second_accumulator -= 1.0
-                for i in range(len(scores)):
-                    scores[i] += 1
+                if show_score:
+                    for i in range(len(scores)):
+                        scores[i] += 1
 
             if time_remaining <= 0:
                 time_remaining = 0
-                state = "game_over"
-                winner_pulse_time = 0.0
+                if auto_exit_on_finish:
+                    running = False # Exit loop immediately for calibration modes
+                else:
+                    state = "game_over"
+                    winner_pulse_time = 0.0
 
         if state == "game_over":
             winner_pulse_time += dt
@@ -364,7 +419,7 @@ def main() -> None:
                     hit_timers[i] = max(0.0, hit_timers[i] - dt)
 
         # Spawn and update projectiles only during active play
-        if projectile_types and state == "playing":
+        if show_projectiles and projectile_types and state == "playing":
             projectile_spawn_accumulator += dt
             if projectile_spawn_accumulator >= projectile_spawn_interval:
                 projectile_spawn_accumulator -= projectile_spawn_interval
@@ -384,7 +439,7 @@ def main() -> None:
                 img = proj_type["image"]
                 if img is not None:
                     dragon_y_for_target = map_strength_to_y(
-                        strengths[target_idx],
+                        local_strengths[target_idx],
                         window_height,
                         dragon_img.get_height(),
                         # Give players more room to move vertically
@@ -509,7 +564,7 @@ def main() -> None:
                         t = idx / float(num_players - 1)
                         dragon_center_x = left_band + t * (right_band - left_band)
                     dragon_y = map_strength_to_y(
-                        strengths[idx],
+                        local_strengths[idx],
                         window_height,
                         dragon_img.get_height(),
                         # Same expanded vertical range as in the draw pass
@@ -533,7 +588,8 @@ def main() -> None:
 
                         # Mark hit for swirl animation and deduct score
                         hit_timers[idx] = 0.6
-                        scores[idx] = max(0, scores[idx] - 5)
+                        if show_score:
+                            scores[idx] = max(0, scores[idx] - 5)
 
         # Update cloud positions (wrap around screen)
         cloud1_x -= cloud_speed_1 * dt
@@ -557,10 +613,16 @@ def main() -> None:
 
         # Task type badge (top-center), color-coded
         task_type = session_cfg.task_type.lower()
-        if task_type == "training":
+        if "relax" in task_type:
+            task_label = "Relax"
+            task_color = (59, 130, 246) # Cool Blue
+        elif "focus" in task_type:
+            task_label = "Focus"
+            task_color = (249, 115, 22) # Warm Orange
+        elif "training" in task_type:
             task_label = "Training"
             task_color = (234, 179, 8)  # yellow
-        elif task_type == "live":
+        elif "live" in task_type:
             task_label = "Live Play"
             task_color = (34, 197, 94)  # green
         else:
@@ -616,7 +678,7 @@ def main() -> None:
             # Allow the dragon to travel much further up and down the screen
             # by using smaller top/bottom margins in the mapping.
             dragon_y = map_strength_to_y(
-                strengths[idx],
+                local_strengths[idx],
                 window_height,
                 dragon_img.get_height(),
                 top_margin=int(80 * ui_scale),
@@ -711,7 +773,7 @@ def main() -> None:
 
             # Filled part representing current strength (0 bottom -> relaxed,
             # 100 top -> fully focused) with a temperature-like gradient.
-            ratio = max(0.0, min(1.0, strengths[idx] / float(MAX_STRENGTH or 1)))
+            ratio = max(0.0, min(1.0, local_strengths[idx] / float(MAX_STRENGTH or 1)))
             filled_height = int(bar_max_height * ratio)
             fill_rect = pygame.Rect(
                 bar_x,
@@ -719,7 +781,7 @@ def main() -> None:
                 bar_width,
                 filled_height,
             )
-            fill_color = strength_to_color(strengths[idx])
+            fill_color = strength_to_color(local_strengths[idx])
             pygame.draw.rect(
                 screen,
                 fill_color,
@@ -729,7 +791,7 @@ def main() -> None:
 
             # Wearing status indicator integrated into the bar widget:
             # a small red/green dot at the top of the bar column.
-            status_color = (52, 199, 89) if player.wearing else (255, 59, 48)
+            status_color = (52, 199, 89) if local_wearing[idx] else (255, 59, 48)
             status_radius = max(5, int(6 * ui_scale))
             status_center = (
                 bar_bg_rect.centerx,
@@ -796,29 +858,30 @@ def main() -> None:
 
         # Overlay per-player strength/score summary at the bottom in its own glass panel,
         # clearly indicating which values belong to which player.
-        summary_parts = []
-        for idx, player in enumerate(players):
-            summary_parts.append(
-                f"P{player.number} ({player.name}) - Focus: {strengths[idx]}  Score: {scores[idx]}"
+        if show_score:
+            summary_parts = []
+            for idx, player in enumerate(players):
+                summary_parts.append(
+                    f"P{player.number} ({player.name}) - Focus: {local_strengths[idx]}  Score: {scores[idx]}"
+                )
+            # Use a simple bullet separator between players
+            summary_text = "   •   ".join(summary_parts)
+            summary_surf = small_font.render(summary_text, True, (17, 24, 39))
+            summary_rect = summary_surf.get_rect()
+            summary_rect.midbottom = (
+                window_width // 2,
+                window_height - int(12 * ui_scale),
             )
-        # Use a simple bullet separator between players
-        summary_text = "   •   ".join(summary_parts)
-        summary_surf = small_font.render(summary_text, True, (17, 24, 39))
-        summary_rect = summary_surf.get_rect()
-        summary_rect.midbottom = (
-            window_width // 2,
-            window_height - int(12 * ui_scale),
-        )
-        summary_panel = summary_rect.inflate(int(32 * ui_scale), int(10 * ui_scale))
-        draw_glass_panel(
-            screen,
-            summary_panel,
-            base_color=(255, 255, 255),
-            radius=int(16 * ui_scale),
-            fill_alpha=150,
-            border_alpha=200,
-        )
-        screen.blit(summary_surf, summary_rect)
+            summary_panel = summary_rect.inflate(int(32 * ui_scale), int(10 * ui_scale))
+            draw_glass_panel(
+                screen,
+                summary_panel,
+                base_color=(255, 255, 255),
+                radius=int(16 * ui_scale),
+                fill_alpha=150,
+                border_alpha=200,
+            )
+            screen.blit(summary_surf, summary_rect)
 
         # Game-over overlay: show final scores, declare winner, and offer rematch options.
         if state == "game_over":
@@ -954,6 +1017,10 @@ def main() -> None:
         pygame.display.flip()
 
     pygame.quit()
+
+
+def main() -> None:
+    asyncio.run(run_game_loop())
 
 
 if __name__ == "__main__":  # pragma: no cover - direct run

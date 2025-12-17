@@ -171,12 +171,36 @@ class PlayerCard(QFrame):
         self.set_wearing_status(True)
         self._refresh_style()
 
+    def set_connection_state(self, state: str):
+        """
+        state: 'disconnected', 'connecting', 'connected'
+        """
+        if state == "disconnected":
+            self.selected = False
+            self.pill.setVisible(False)
+        elif state == "connecting":
+            self.selected = True
+            self.pill.setText("Connecting...")
+            self.pill.setProperty("state", "connecting")
+            self.pill.setVisible(True)
+        elif state == "connected":
+            self.selected = True
+            self.pill.setText("Connected")
+            self.pill.setProperty("state", "connected")
+            self.pill.setVisible(True)
+        
+        self.pill.style().unpolish(self.pill)
+        self.pill.style().polish(self.pill)
+        self._refresh_style()
+
     def set_wearing_status(self, is_wearing: bool):
         self.wearing_indicator.setProperty("wearing", "good" if is_wearing else "bad")
         self.wearing_indicator.style().unpolish(self.wearing_indicator)
         self.wearing_indicator.style().polish(self.wearing_indicator)
 
     def set_selected(self, selected: bool):
+        # Deprecated in favor of set_connection_state for logic, 
+        # but kept for compatibility if needed, though we should avoid using it for logic now.
         self.selected = selected
         self.pill.setVisible(self.selected)
         self._refresh_style()
@@ -185,7 +209,7 @@ class PlayerCard(QFrame):
         if not self.device:
             return
         if event.button() == Qt.LeftButton:
-            self.set_selected(not self.selected)
+            # self.set_selected(not self.selected) # Removed immediate toggle
             self.toggled.emit(self)
 
     def _refresh_style(self):
@@ -324,6 +348,21 @@ class IFocusWindow(QMainWindow):
 
     def set_devices(self, devices: List[DeviceInfo]):
         self._layout_cards(devices)
+        
+    def set_connection_state(self, mac: str, state: str):
+        """
+        Update the UI state for a specific device.
+        state: 'disconnected', 'connecting', 'connected'
+        """
+        for c in self.cards:
+            if c.device and c.device.mac == mac:
+                c.set_connection_state(state)
+                if state == "connected":
+                    self.selected_macs.add(mac)
+                else:
+                    self.selected_macs.discard(mac)
+                break
+        self._update_play_state()
 
     def clear_cards(self):
         while self.grid.count():
@@ -351,8 +390,15 @@ class IFocusWindow(QMainWindow):
         self.searchRequested.emit()
 
     def _on_play_clicked(self):
-        macs = sorted(self.selected_macs)
-        self.playRequested.emit(macs)
+        # Collect selected devices with their names
+        players_info = []
+        for mac in sorted(self.selected_macs):
+            for c in self.cards:
+                if c.device and c.device.mac == mac:
+                    name = c.name_lbl.text().strip() or c.device.name
+                    players_info.append({"mac": mac, "name": name})
+                    break
+        self.playRequested.emit(players_info)
 
     # -----------------------------
     # Card management + dynamic layout
@@ -398,14 +444,14 @@ class IFocusWindow(QMainWindow):
         if not card.device:
             return
         mac = card.device.mac
+        
+        # Determine intent based on current selection state
+        # If currently selected (connected/connecting), we want to disconnect (False)
+        # If currently unselected, we want to connect (True)
+        intent_selected = not card.selected
 
-        if card.selected:
-            self.selected_macs.add(mac)
-        else:
-            self.selected_macs.discard(mac)
-
-        self._update_play_state()
-        self.deviceToggled.emit(mac, card.selected)
+        # We do NOT update selected_macs here anymore, we wait for connection success
+        self.deviceToggled.emit(mac, intent_selected)
 
     def _update_play_state(self):
         self.play_btn.setEnabled(len(self.selected_macs) > 0)
