@@ -100,6 +100,9 @@ async def iFocusRealTimeReader(client, chunk_sec: float = 1.0):
                 yield np.array(buffer[:chunk_samples], dtype=float)
                 del buffer[:chunk_samples]
                 
+    except GeneratorExit:
+        # Generator is being closed; clean up silently
+        pass
     finally:
         try:
             await client.write_gatt_char(COMMAND_CHAR_UUID, b"\x02", response=True)

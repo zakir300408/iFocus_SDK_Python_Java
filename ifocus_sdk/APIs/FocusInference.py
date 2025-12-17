@@ -91,8 +91,9 @@ async def _inference_loop(
         warning_interval = 2.0
         was_wearing = True
         
+        reader = iFocusRealTimeReader(client, chunk_sec=chunk_sec)
         try:
-            async for chunk in iFocusRealTimeReader(client, chunk_sec=chunk_sec):
+            async for chunk in reader:
                 if stop_event.is_set():
                     break
                 
@@ -141,9 +142,12 @@ async def _inference_loop(
                         callback(label, strength, timestamp)
                     except Exception as e:
                         logger.warning("Callback error: %s", e)
-        except GeneratorExit:
-            # Stop was requested while the generator was mid-iteration; just exit quietly
-            pass
+        finally:
+            # Properly close the async generator to avoid GeneratorExit warnings
+            try:
+                await reader.aclose()
+            except Exception:
+                pass
     
     except Exception as e:
         logger.exception("Inference loop failed: %s", e)

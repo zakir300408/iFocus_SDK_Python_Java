@@ -171,16 +171,15 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     display_info = pygame.display.Info()
     screen_w, screen_h = display_info.current_w, display_info.current_h
 
-    base_scale = max(0.85, min(1.45, min(screen_w / 1440.0, screen_h / 900.0)))
-    fit_scale = min(screen_w / BASE_WIDTH, screen_h / BASE_HEIGHT)
-    ui_scale = min(base_scale, fit_scale)
+    # Use maximized window mode with title bar (not fullscreen)
+    # This allows users to close the window easily
+    window_width = screen_w
+    window_height = screen_h
+    ui_scale = min(screen_w / 1440.0, screen_h / 900.0)
     if ui_scale <= 0:
         ui_scale = 0.5
 
-    window_width = int(BASE_WIDTH * ui_scale)
-    window_height = int(BASE_HEIGHT * ui_scale)
-
-    screen = pygame.display.set_mode((window_width, window_height))
+    screen = pygame.display.set_mode((window_width, window_height), pygame.RESIZABLE)
     clock = pygame.time.Clock()
 
     # Session / player configuration (isolated from UI logic)
@@ -224,9 +223,10 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     background = load_image("skyblue.png")
     cloud_img = load_image("cloud.png")
     cloud2_img = load_image("cloud2.png")
-    dragon_img = load_image("dragondown.png")
+    dragon_img = load_image("dragon_wings_up.png")
+    dragon_img2 = load_image("dragon_wings_down.png")
 
-    # Optional projectile / obstacle sprites
+    # Optional projectile / obstacle 3.3
     fireball_img = try_load_image("fireball.png")
     arrow_img = try_load_image("arrow.png")
     javelin_img = try_load_image("javelin.png")
@@ -250,17 +250,20 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     cloud2_img = scale_to_width(cloud2_img, int(window_width * 0.22))
 
     # Dragon: scale by height so it does not dominate the screen
-    dragon_h_target = int(window_height * 0.22)
+    dragon_h_target = int(window_height * 0.14)
     d_w, d_h = dragon_img.get_size()
     if d_h > 0:
         d_scale = dragon_h_target / float(d_h)
         dragon_size = (int(d_w * d_scale), int(d_h * d_scale))
         dragon_img = pygame.transform.smoothscale(dragon_img, dragon_size)
+        dragon_img2 = pygame.transform.smoothscale(dragon_img2, dragon_size)
 
     # Projectile configuration (slow, readable motion)
     projectile_types = []
     # Make base speed quite slow so movement is gentle
-    base_speed = 80 * ui_scale
+    # Use config from game_state if available, otherwise default
+    base_speed_multiplier = game_state.get("projectile_base_speed", 80) if game_state else 80
+    base_speed = base_speed_multiplier * ui_scale
 
     # Scale projectiles so they sit nicely in the scene.
     # Slightly smaller so they feel less punishing.
@@ -305,8 +308,15 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     local_strengths = [50 for _ in players]
     local_wearing = [True for _ in players]
     
+    # Interpolated strengths for smooth movement (avoids teleporting)
+    interpolated_strengths = [50.0 for _ in players]
+    
     scores = [0 for _ in players]
     hit_timers = [0.0 for _ in players]
+
+    # Wing animation timing
+    wing_animation_timer = 0.0
+    wing_flap_interval = 0.3  # seconds between wing flaps
 
     # Round timer (seconds)
     round_duration = max(1, getattr(session_cfg, "duration_seconds", 60))
@@ -318,7 +328,8 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     projectile_spawn_accumulator = 0.0
     # Spawn very slowly so players are nudged to move,
     # but not overwhelmed.
-    projectile_spawn_interval = 8.0  # seconds
+    # Use config from game_state if available, otherwise default
+    projectile_spawn_interval = game_state.get("projectile_spawn_interval", 8.0) if game_state else 8.0  # seconds
     # Remember which player was targeted last so we can avoid
     # picking the same one twice in a row when possible.
     last_projectile_target_idx = None
@@ -384,6 +395,14 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
             
         last_time = current_time
 
+        # Update wing animation
+        wing_animation_timer += dt
+        if wing_animation_timer >= wing_flap_interval * 2:
+            wing_animation_timer = 0.0
+        
+        # Select which dragon image to use based on animation timer
+        current_dragon_img = dragon_img if wing_animation_timer < wing_flap_interval else dragon_img2
+
         # Sync with external game_state if provided
         if game_state:
             if not game_state.get("running", True):
@@ -420,6 +439,17 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
             ext_wearing = game_state.get("wearing", [])
             for i in range(min(len(local_wearing), len(ext_wearing))):
                 local_wearing[i] = ext_wearing[i]
+        
+        # Smoothly interpolate character positions to avoid teleporting
+        # Use fast interpolation (lerp factor based on dt) for continuous movement
+        interpolation_speed = 8.0  # Higher = faster convergence to target
+        for i in range(len(players)):
+            target_strength = local_strengths[i]
+            current_strength = interpolated_strengths[i]
+            
+            # Lerp towards target: smooth but fast
+            diff = target_strength - current_strength
+            interpolated_strengths[i] += diff * min(1.0, interpolation_speed * dt)
 
         # Event handling
         # Process pygame events carefully to avoid interfering with Qt event loop
@@ -427,9 +457,13 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                    if game_state is not None:
+                        game_state["running"] = False
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
+                        if game_state is not None:
+                            game_state["running"] = False
                     # Removed K_UP/K_DOWN manual control
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     if state == "game_over":
@@ -499,9 +533,9 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                 img = proj_type["image"]
                 if img is not None:
                     dragon_y_for_target = map_strength_to_y(
-                        local_strengths[target_idx],
+                        interpolated_strengths[target_idx],
                         window_height,
-                        dragon_img.get_height(),
+                        current_dragon_img.get_height(),
                         # Give players more room to move vertically
                         top_margin=int(80 * ui_scale),
                         bottom_margin=int(4 * ui_scale),
@@ -523,12 +557,12 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                     else:
                         pattern = [0]
 
-                    vertical_step = int(dragon_img.get_height() * 0.2)
+                    vertical_step = int(current_dragon_img.get_height() * 0.2)
 
                     for offset_index in pattern:
                         spawn_y = int(
                             dragon_y_for_target
-                            + dragon_img.get_height() * 0.35
+                            + current_dragon_img.get_height() * 0.35
                             + offset_index * vertical_step
                         )
 
@@ -538,8 +572,8 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                         # Aim roughly towards the chosen target point with
                         # slight random vertical offset to vary the arc.
                         aim_y = dragon_y_for_target + random.uniform(
-                            -dragon_img.get_height() * 0.2,
-                            dragon_img.get_height() * 0.2,
+                            -current_dragon_img.get_height() * 0.2,
+                            current_dragon_img.get_height() * 0.2,
                         )
                         dx = target_x - spawn_x
                         dy = aim_y - spawn_y
@@ -624,19 +658,19 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                         t = idx / float(num_players - 1)
                         dragon_center_x = left_band + t * (right_band - left_band)
                     dragon_y = map_strength_to_y(
-                        local_strengths[idx],
+                        interpolated_strengths[idx],
                         window_height,
-                        dragon_img.get_height(),
+                        current_dragon_img.get_height(),
                         # Same expanded vertical range as in the draw pass
                         top_margin=int(80 * ui_scale),
                         bottom_margin=int(4 * ui_scale),
                     )
-                    dragon_x = int(dragon_center_x - dragon_img.get_width() / 2)
+                    dragon_x = int(dragon_center_x - current_dragon_img.get_width() / 2)
                     dragon_rect = pygame.Rect(
                         dragon_x,
                         int(dragon_y),
-                        dragon_img.get_width(),
-                        dragon_img.get_height(),
+                        current_dragon_img.get_width(),
+                        current_dragon_img.get_height(),
                     )
                     if dragon_rect.colliderect(proj_rect):
                         # Avoid repeatedly hitting the same player with the same projectile
@@ -726,6 +760,9 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
         # Draw each player's dragon (with optional swirl), label, and status
         num_players = len(players)
         for idx, player in enumerate(players):
+            # Use interpolated strength for smooth movement
+            current_strength = interpolated_strengths[idx]
+            
             # Horizontal position: spread players across a band that is
             # clearly on the left side of the screen with a bit more
             # distance between them.
@@ -739,15 +776,15 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
             # Allow the dragon to travel much further up and down the screen
             # by using smaller top/bottom margins in the mapping.
             dragon_y = map_strength_to_y(
-                local_strengths[idx],
+                current_strength,
                 window_height,
-                dragon_img.get_height(),
+                current_dragon_img.get_height(),
                 top_margin=int(80 * ui_scale),
                 bottom_margin=int(4 * ui_scale),
             )
 
             # Base center for the sprite
-            base_center_y = dragon_y + dragon_img.get_height() / 2
+            base_center_y = dragon_y + current_dragon_img.get_height() / 2
             base_center = (int(dragon_center_x), int(base_center_y))
 
             if hit_timers[idx] > 0:
@@ -756,10 +793,10 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                 angle = 10 * math.sin(t * 18)
                 offset_y = -8 * ui_scale * abs(math.sin(t * 12))
                 center = (base_center[0], int(base_center[1] + offset_y))
-                sprite = pygame.transform.rotozoom(dragon_img, angle, 1.0)
+                sprite = pygame.transform.rotozoom(current_dragon_img, angle, 1.0)
                 dragon_rect = sprite.get_rect(center=center)
             else:
-                sprite = dragon_img
+                sprite = current_dragon_img
                 dragon_rect = sprite.get_rect(center=base_center)
 
             # Dragon sprite

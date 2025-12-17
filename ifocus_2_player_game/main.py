@@ -41,6 +41,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 logger.setLevel(logging.INFO)  # Keep main at INFO, but allow DEBUG from SDK
 
+# ============================================================
+# SESSION CONFIGURATION - Easy to adjust
+# ============================================================
+# Calibration settings
+NUM_RELAX_ROUNDS = 1        # Number of RELAX calibration rounds
+NUM_FOCUS_ROUNDS = 1        # Number of FOCUS calibration rounds
+RELAX_DURATION = 10         # Duration of each RELAX round (seconds)
+FOCUS_DURATION = 10         # Duration of each FOCUS round (seconds)
+
+# Live play settings
+LIVE_DURATION = 60          # Duration of live gameplay (seconds)
+INFERENCE_UPDATE_HZ = 2.0   # Focus score updates per second during live play
+
+# Projectile and obstacle settings
+PROJECTILE_BASE_SPEED = 80      # Base speed multiplier for projectiles (pixels/second, scaled by UI)
+PROJECTILE_SPAWN_INTERVAL = 8.0 # Time between projectile spawns (seconds)
+# ============================================================
+
 class GameController:
     def __init__(self, window: IFocusWindow):
         self.window = window
@@ -77,11 +95,14 @@ class GameController:
         try:
             logger.info("Scanning for devices...")
             # _scan_ifocus_devices returns list of (addr, name, rssi)
-            devices_raw = await _scan_ifocus_devices(timeout_s=3.0)
+            devices_raw = await _scan_ifocus_devices(timeout_s=6.0)
             
             devices = []
-            for addr, name, rssi in devices_raw:
-                devices.append(DeviceInfo(name=name, mac=addr, rssi=rssi))
+            for i, (addr, name, rssi) in enumerate(devices_raw):
+                # Assign default player names (Player 1, Player 2, etc.)
+                # instead of device names which might be confusing/identical
+                player_name = f"Player {i + 1}"
+                devices.append(DeviceInfo(name=player_name, mac=addr, rssi=rssi))
             
             # Limit to 4
             devices = devices[:4]
@@ -179,7 +200,9 @@ class GameController:
                 "id": "init",
                 "type": "RELAX",
                 "duration": 10
-            }
+            },
+            "projectile_base_speed": PROJECTILE_BASE_SPEED,
+            "projectile_spawn_interval": PROJECTILE_SPAWN_INTERVAL,
         }
 
         # Configure initial session config for the UI to pick up players
@@ -265,12 +288,18 @@ class GameController:
 
                 await asyncio.sleep(0.1)
 
-        async def run_inference_session(calibrate: bool, live_duration: int = 60):
+        async def run_inference_session(calibrate: bool, live_duration: int = LIVE_DURATION):
             """Optionally recalibrate/train, then run inference + live stage."""
 
             if calibrate:
-                await run_stage_logic("RELAX", 10)
-                await run_stage_logic("FOCUS", 10)
+                # Run calibration rounds based on configuration
+                for round_num in range(NUM_RELAX_ROUNDS):
+                    logger.info(f"RELAX round {round_num + 1}/{NUM_RELAX_ROUNDS}")
+                    await run_stage_logic("RELAX", RELAX_DURATION)
+                
+                for round_num in range(NUM_FOCUS_ROUNDS):
+                    logger.info(f"FOCUS round {round_num + 1}/{NUM_FOCUS_ROUNDS}")
+                    await run_stage_logic("FOCUS", FOCUS_DURATION)
 
                 logger.info("Training models...")
                 from ifocus_sdk.APIs.trainFocusModel import trainFocusModel
@@ -299,7 +328,7 @@ class GameController:
                         return cb
 
                     task = asyncio.create_task(
-                        startFocusInference(player_name, client, updateHz=2.0, callback=make_callback(idx))
+                        startFocusInference(player_name, client, updateHz=INFERENCE_UPDATE_HZ, callback=make_callback(idx))
                     )
                     inference_tasks.append((mac, player_name, client, task))
 
@@ -342,7 +371,7 @@ class GameController:
                             logger.warning(f"Reset failed for {player_name}: {e}")
 
                 # Run session (calibration+train+live or just live with existing model)
-                await run_inference_session(calibrate=calibrate, live_duration=60)
+                await run_inference_session(calibrate=calibrate, live_duration=LIVE_DURATION)
 
                 # Wait for user choice from UI (rematch or start fresh)
                 chosen = None
