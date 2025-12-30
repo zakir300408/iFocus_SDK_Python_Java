@@ -25,8 +25,14 @@ from .__epoch_maker import EpochMaker
 logger = logging.getLogger(__name__)
 
 # Training configuration
-TRAIN_WIN_SEC = 3.0
-TRAIN_UPDATE_HZ = 2.0
+# Window length (seconds) used to build each training epoch.
+# This value is saved into the trained model payload as `win_sec` and is also
+# used by live inference unless overridden.
+TRAIN_WIN_SEC = 4.0
+
+# How often to advance the sliding window during training (epochs/sec).
+# Higher values => smaller hop => more overlapping training examples.
+TRAIN_UPDATE_HZ = 4.0
 
 
 def _get_latest_model_path(subject_id: str) -> Optional[Path]:

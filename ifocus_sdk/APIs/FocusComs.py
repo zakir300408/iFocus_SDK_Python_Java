@@ -90,6 +90,10 @@ async def connect(
     """
     global _client, _connection_callback, _auto_reconnect, _target_device_id
 
+    # Always tear down any stale client before attempting a new connection.
+    # This avoids hidden lingering connections that block fresh connection attempts.
+    await disconnect()
+
     # Already connected to this device
     if _client and _client.is_connected and _client.address == device_id:
         if callback:

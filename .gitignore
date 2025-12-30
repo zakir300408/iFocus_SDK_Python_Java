@@ -2,3 +2,7 @@
 __pycache__/
 .vscode/
 ifocus_sdk/APIs/__pycache__/
+*.bdf
+/dist/
+/build/
+

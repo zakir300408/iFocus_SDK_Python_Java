@@ -536,6 +536,17 @@ async def calibrationControl(
             return True
 
         if _device_id:
+            # Send stop command before dropping the link to mimic close_socket behavior.
+            if _client and _client.is_connected:
+                try:
+                    await _client.write_gatt_char(COMMAND_CHAR_UUID, b"\x02", response=True)
+                except Exception:
+                    pass
+                try:
+                    await _client.stop_notify(DATA_CHAR_UUID)
+                except Exception:
+                    pass
+                _streaming = False
             try:
                 await disconnect(_device_id)
             except Exception:

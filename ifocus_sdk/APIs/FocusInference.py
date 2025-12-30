@@ -55,7 +55,8 @@ def _compute_focus_strength(features: dict, proba: np.ndarray, classes: List) ->
         tbr = min(theta / (beta + eps), 10.0)
         tbr_focus = np.clip(1.0 - (tbr - 0.5) / 3.5, 0.0, 1.0)
         
-        weights = (0.4, 0.3, 0.3)
+        # Allocate 15% to EEG-derived ratios (split proportionally) and 85% to label probability.
+        weights = (0.09, 0.06, 0.85)
     else:
         engagement_norm = tbr_focus = 0.5
         weights = (0.0, 0.0, 1.0)
@@ -81,10 +82,16 @@ async def _inference_loop(
         feature_names = payload["feature_names"]
         classes = payload.get("classes") or list(getattr(model, "classes_", []))
         fs = float(payload.get("fs", DEFAULT_SAMPLE_RATE))
-        win_sec = float(payload.get("win_sec", 3.0))
-        
+
+        # Keep prediction window fixed at 4 seconds for live inference.
+        # Note: if an older model was trained with a different window length,
+        # performance may differ; retrain to match this setting.
+        win_sec = 4.0
+
         epoch_maker = EpochMaker(win_sec=win_sec, update_frequency=update_hz)
-        chunk_sec = min(0.5, win_sec / 4.0)
+
+        # Smaller chunks reduce bursty callbacks at high update rates (e.g., 50Hz).
+        chunk_sec = min(0.1, win_sec / 4.0)
         
         import time
         last_wearing_warning_time = 0

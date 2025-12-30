@@ -3,6 +3,9 @@ from pathlib import Path
 import math
 import random
 import asyncio
+import logging
+import shutil
+import subprocess
 from typing import Optional, Dict, Any, List
 
 import pygame
@@ -40,6 +43,8 @@ SYSTEM_FONT_STACK = [
     "Helvetica",
     "Arial",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 def make_font(size: int, *, bold: bool = False) -> pygame.font.Font:
@@ -125,6 +130,58 @@ def try_load_image(name: str):
         return None
 
 
+def load_sound(name: str) -> Optional[pygame.mixer.Sound]:
+    """Load a sound effect from assets, converting if necessary."""
+
+    base_dir = Path(__file__).resolve().parents[1]
+    sound_path = base_dir / "assets" / name
+    if not sound_path.exists():
+        logger.warning("Sound effect %s not found.", name)
+        return None
+
+    def _try(path: Path) -> Optional[pygame.mixer.Sound]:
+        try:
+            return pygame.mixer.Sound(str(path))
+        except pygame.error:
+            return None
+
+    sound = _try(sound_path)
+    if sound:
+        return sound
+
+    suffix = sound_path.suffix.lower()
+    if suffix in {".m4a", ".mp4", ".aac"}:
+        converted_path = sound_path.with_suffix(".wav")
+        if converted_path.exists():
+            sound = _try(converted_path)
+            if sound:
+                return sound
+
+        ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+        if ffmpeg:
+            try:
+                subprocess.run(
+                    [ffmpeg, "-y", "-i", str(sound_path), str(converted_path)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                sound = _try(converted_path)
+                if sound:
+                    return sound
+            except Exception as exc:
+                logger.warning("Failed to convert %s via ffmpeg: %s", name, exc)
+        else:
+            logger.warning(
+                "ffmpeg not found; unable to convert %s. Provide a WAV/OGG version for playback.",
+                name,
+            )
+    else:
+        logger.warning("Unable to load sound %s (unsupported format).", name)
+
+    return None
+
+
 def map_strength_to_y(
     strength: int,
     screen_height: int,
@@ -165,6 +222,13 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     pygame.init()
     pygame.display.set_caption("iFocus Play Window")
 
+    try:
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        mixer_available = True
+    except pygame.error:
+        mixer_available = False
+
     # Derive a UI scale based on the current screen, similar in
     # spirit to IFocusWindow in ifocus_ui.py, but also ensuring
     # the window never exceeds the physical screen size.
@@ -201,20 +265,16 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
         nonlocal show_score, show_projectiles, auto_exit_on_finish, theme_color_override, task_type
         task_type = new_task_type.upper()
         
+        is_calibration = "RELAX" in task_type or "FOCUS" in task_type
+        show_score = not is_calibration
+        show_projectiles = not is_calibration
+        auto_exit_on_finish = is_calibration
+        
         if "RELAX" in task_type:
-            show_score = False
-            show_projectiles = False
-            auto_exit_on_finish = True
-            theme_color_override = (59, 130, 246) # Cool Blue
+            theme_color_override = (59, 130, 246)  # Cool Blue
         elif "FOCUS" in task_type:
-            show_score = False
-            show_projectiles = False
-            auto_exit_on_finish = True
-            theme_color_override = (249, 115, 22) # Warm Orange
-        else: # LIVE or default
-            show_score = True
-            show_projectiles = True
-            auto_exit_on_finish = False
+            theme_color_override = (249, 115, 22)  # Warm Orange
+        else:
             theme_color_override = None
 
     update_stage_config(task_type)
@@ -223,8 +283,38 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     background = load_image("skyblue.png")
     cloud_img = load_image("cloud.png")
     cloud2_img = load_image("cloud2.png")
-    dragon_img = load_image("dragon_wings_up.png")
-    dragon_img2 = load_image("dragon_wings_down.png")
+    dragon_img = load_image("dragonup.png")
+    dragon_img2 = load_image("dragondown.png")
+    wing_flap_sound = load_sound("wing_down.m4a") if mixer_available else None
+    fireball_sound = load_sound("fireball.mp3") if mixer_available else None
+    arrow_single_sound = load_sound("single_arrow.mp3") if mixer_available else None
+    arrow_multi_sound = load_sound("multiple_arrow.mp3") if mixer_available else None
+    hit_sound = load_sound("hit.mp3") if mixer_available else None
+
+    if wing_flap_sound:
+        wing_flap_sound.set_volume(0.9)
+    if fireball_sound:
+        fireball_sound.set_volume(1.0)
+    if arrow_single_sound:
+        arrow_single_sound.set_volume(1.0)
+    if arrow_multi_sound:
+        arrow_multi_sound.set_volume(1.0)
+    if hit_sound:
+        hit_sound.set_volume(1.0)
+
+    music_started = False
+    if mixer_available:
+        music_path = Path(__file__).resolve().parents[1] / "assets" / "background_music.mp3"
+        if music_path.exists():
+            try:
+                pygame.mixer.music.load(str(music_path))
+                pygame.mixer.music.set_volume(0.18)
+                pygame.mixer.music.play(-1)
+                music_started = True
+            except pygame.error as exc:
+                logger.warning("Unable to load background music %s: %s", music_path.name, exc)
+        else:
+            logger.warning("Background music %s not found.", music_path.name)
 
     # Optional projectile / obstacle 3.3
     fireball_img = try_load_image("fireball.png")
@@ -266,32 +356,22 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     base_speed = base_speed_multiplier * ui_scale
 
     # Scale projectiles so they sit nicely in the scene.
-    # Slightly smaller so they feel less punishing.
     proj_target_w = int(window_width * 0.07)
 
-    # Always populate projectile_types so they're available when switching to LIVE stage
-    if fireball_img is not None:
-        fireball_img = scale_to_width(fireball_img, proj_target_w)
-        projectile_types.append(
-            {"name": "fireball", "image": fireball_img, "speed": base_speed * 0.7}
-        )
-    if arrow_img is not None:
-        arrow_img = scale_to_width(arrow_img, proj_target_w)
-        projectile_types.append(
-            {"name": "arrow", "image": arrow_img, "speed": base_speed * 0.8}
-        )
-    if javelin_img is not None:
-        javelin_img = scale_to_width(javelin_img, proj_target_w)
-        projectile_types.append(
-            {"name": "javelin", "image": javelin_img, "speed": base_speed * 0.6}
-        )
-    if obstacle_img is not None:
-        obstacle_img = scale_to_width(obstacle_img, proj_target_w)
-        # Flip obstacles so they face toward the players
-        obstacle_img = pygame.transform.flip(obstacle_img, True, False)
-        projectile_types.append(
-            {"name": "obstacle", "image": obstacle_img, "speed": base_speed * 0.5}
-        )
+    # Load and configure projectiles
+    projectile_configs = [
+        ("fireball", fireball_img, 0.7),
+        ("arrow", arrow_img, 0.8),
+        ("javelin", javelin_img, 0.6),
+        ("obstacle", obstacle_img, 0.5),
+    ]
+    
+    for name, img, speed_mult in projectile_configs:
+        if img is not None:
+            img = scale_to_width(img, proj_target_w)
+            if name == "obstacle":
+                img = pygame.transform.flip(img, True, False)  # Face toward players
+            projectile_types.append({"name": name, "image": img, "speed": base_speed * speed_mult})
 
     # Simple cloud layers for parallax-like motion
     cloud_speed_1 = 40  # pixels / second
@@ -313,10 +393,21 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
     
     scores = [0 for _ in players]
     hit_timers = [0.0 for _ in players]
+    
+    # Simulation state for calibration stages (RELAX and FOCUS)
+    # During calibration, we simulate dragon movement to guide users
+    simulation_active = False
+    simulation_target_strengths = [50.0 for _ in players]  # Target values for simulation
+    simulation_direction = [1.0 for _ in players]  # 1.0 for ascending, -1.0 for descending
+    simulation_speed = 8.0  # Units per second (slow movement)
+    simulation_reverse_timer = 0.0  # Timer for occasional reverse movements
+    simulation_reverse_interval = 4.0  # Reverse direction every 4-6 seconds
+    simulation_reverse_duration = 0.8  # Duration of reverse movement (shorter, more abrupt)
 
     # Wing animation timing
     wing_animation_timer = 0.0
-    wing_flap_interval = 0.3  # seconds between wing flaps
+    wing_flap_interval = 0.6  # seconds per wing state to match audio
+    wing_was_down = False
 
     # Round timer (seconds)
     round_duration = max(1, getattr(session_cfg, "duration_seconds", 60))
@@ -325,7 +416,8 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
 
     # Projectiles
     projectiles: list[dict] = []  # each: {image, rect, x, y, vx, vy, age, swirl_amp, swirl_freq, swirl_phase, name}
-    projectile_spawn_accumulator = 0.0
+    # Start accumulator closer to spawn interval to spawn projectiles earlier
+    projectile_spawn_accumulator = 1.0
     # Spawn very slowly so players are nudged to move,
     # but not overwhelmed.
     # Use config from game_state if available, otherwise default
@@ -362,12 +454,21 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
 
     # Game state
     running = True
-    state = "playing"  # or "game_over"
+    state = "playing"  # or "game_over", "waiting_next_stage", "preparation", "training_results"
     winner_pulse_time = 0.0
     rematch_button_rect = None
     startfresh_button_rect = None
     
     current_stage_id = None
+    
+    # Preparation phase variables
+    preparation_duration = 5.0  # 5 seconds countdown
+    preparation_time_remaining = 0.0
+    preparation_task_type = ""  # What task is coming up
+    
+    # Training results display
+    training_results_duration = 4.0  # 4 seconds to display results
+    training_results_time_remaining = 0.0
 
     # Use asyncio sleep for timing to avoid blocking the event loop with clock.tick
     target_frame_time = 1.0 / FPS
@@ -397,11 +498,22 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
 
         # Update wing animation
         wing_animation_timer += dt
-        if wing_animation_timer >= wing_flap_interval * 2:
-            wing_animation_timer = 0.0
-        
+        wing_cycle = max(wing_flap_interval * 2.0, 1e-6)
+        while wing_animation_timer >= wing_cycle:
+            wing_animation_timer -= wing_cycle
+
+        wing_down_active = wing_animation_timer >= wing_flap_interval
+        if (
+            wing_down_active
+            and not wing_was_down
+            and wing_flap_sound
+            and state == "playing"
+        ):
+            wing_flap_sound.play()
+        wing_was_down = wing_down_active
+
         # Select which dragon image to use based on animation timer
-        current_dragon_img = dragon_img if wing_animation_timer < wing_flap_interval else dragon_img2
+        current_dragon_img = dragon_img2 if wing_down_active else dragon_img
 
         # Sync with external game_state if provided
         if game_state:
@@ -415,6 +527,13 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                 
                 # Update configuration
                 new_task_type = stage_info.get("type", "LIVE")
+                
+                # Check if this is the training results stage
+                if new_task_type == "TRAINING_RESULTS":
+                    state = "training_results"
+                    training_results_time_remaining = training_results_duration
+                    continue  # Skip rest of stage setup for training results
+                
                 update_stage_config(new_task_type)
                 
                 # Reset round state
@@ -425,10 +544,37 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                 scores = [0 for _ in players]
                 hit_timers = [0.0 for _ in players]
                 projectiles.clear()
-                projectile_spawn_accumulator = 0.0
+                # Start accumulator at 1.0 to spawn projectiles earlier
+                projectile_spawn_accumulator = 1.0
                 last_projectile_target_idx = None
                 winner_pulse_time = 0.0
-                state = "playing"
+                
+                # Reset simulation state and set starting positions based on task type
+                simulation_reverse_timer = 0.0
+                new_task_lower = new_task_type.lower()
+                
+                # Helper to set all player strengths
+                def set_all_strengths(value: float):
+                    for i in range(len(players)):
+                        simulation_target_strengths[i] = value
+                        local_strengths[i] = int(value)
+                        interpolated_strengths[i] = value
+                
+                # Enter preparation state for RELAX and FOCUS stages
+                if "relax" in new_task_lower or "focus" in new_task_lower:
+                    state = "preparation"
+                    preparation_time_remaining = preparation_duration
+                    preparation_task_type = new_task_type
+                else:
+                    state = "playing"
+                
+                # Set initial positions
+                if "relax" in new_task_lower:
+                    set_all_strengths(100.0)  # Start from top
+                elif "focus" in new_task_lower:
+                    set_all_strengths(0.0)  # Start from bottom
+                else:
+                    set_all_strengths(50.0)  # Start from middle
             
             # Update strengths safely
             ext_strengths = game_state.get("strengths", [])
@@ -440,16 +586,36 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
             for i in range(min(len(local_wearing), len(ext_wearing))):
                 local_wearing[i] = ext_wearing[i]
         
-        # Smoothly interpolate character positions to avoid teleporting
-        # Use fast interpolation (lerp factor based on dt) for continuous movement
-        interpolation_speed = 8.0  # Higher = faster convergence to target
-        for i in range(len(players)):
-            target_strength = local_strengths[i]
-            current_strength = interpolated_strengths[i]
+        # Determine if simulation should be active based on current task type
+        current_task_lower = task_type.lower()
+        simulation_active = "relax" in current_task_lower or "focus" in current_task_lower
+        
+        # Simulation logic for calibration stages
+        if simulation_active and state == "playing":
+            simulation_reverse_timer += dt
             
-            # Lerp towards target: smooth but fast
-            diff = target_strength - current_strength
-            interpolated_strengths[i] += diff * min(1.0, interpolation_speed * dt)
+            # Check if it's time to reverse direction
+            if simulation_reverse_timer >= simulation_reverse_interval:
+                simulation_reverse_timer = 0.0
+                simulation_reverse_interval = 4.0 + random.random() * 2.0  # Randomize next interval
+                for i in range(len(players)):
+                    simulation_direction[i] *= -1.0
+            
+            in_reverse_phase = simulation_reverse_timer < simulation_reverse_duration
+            base_direction = -1.0 if "relax" in current_task_lower else 1.0  # -1=descend, 1=ascend
+            
+            # Update simulated target strengths
+            for i in range(len(players)):
+                effective_direction = -base_direction if in_reverse_phase else base_direction
+                simulation_target_strengths[i] += effective_direction * simulation_speed * dt
+                simulation_target_strengths[i] = max(MIN_STRENGTH, min(MAX_STRENGTH, simulation_target_strengths[i]))
+                local_strengths[i] = int(simulation_target_strengths[i])
+        
+        # Smoothly interpolate character positions
+        for i in range(len(players)):
+            diff = local_strengths[i] - interpolated_strengths[i]
+            # Lower interpolation gain to make vertical movement less abrupt.
+            interpolated_strengths[i] += diff * min(1.0, 4.0 * dt)
 
         # Event handling
         # Process pygame events carefully to avoid interfering with Qt event loop
@@ -479,6 +645,18 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                             state = "waiting_next_stage"
         except Exception:
             pass  # Ignore event processing errors to avoid blocking
+
+        # Countdown logic for special states
+        if state == "training_results":
+            training_results_time_remaining -= dt
+            if training_results_time_remaining <= 0:
+                state = "waiting_next_stage"
+                training_results_time_remaining = 0.0
+        elif state == "preparation":
+            preparation_time_remaining -= dt
+            if preparation_time_remaining <= 0:
+                state = "playing"
+                preparation_time_remaining = 0.0
 
         # Timer and scoring: each full second that passes
         # awards +1 score point to every player while time remains.
@@ -532,13 +710,22 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                 proj_type = random.choice(projectile_types)
                 img = proj_type["image"]
                 if img is not None:
+                    # 70% of projectiles target bottom/middle, 30% target upper area
+                    # to discourage zoning out (staying relaxed at bottom)
+                    if random.random() < 0.7:
+                        # Target bottom and middle: strength 0-60
+                        biased_strength = random.uniform(0, 60)
+                    else:
+                        # Target upper area: strength 60-100
+                        biased_strength = random.uniform(60, 100)
+                    
                     dragon_y_for_target = map_strength_to_y(
-                        interpolated_strengths[target_idx],
+                        biased_strength,
                         window_height,
                         current_dragon_img.get_height(),
-                        # Give players more room to move vertically
-                        top_margin=int(80 * ui_scale),
-                        bottom_margin=int(4 * ui_scale),
+                        # Expanded range so targets can appear nearer the top and bottom edges.
+                        top_margin=int(30 * ui_scale),
+                        bottom_margin=int(0 * ui_scale),
                     )
 
                     # Choose a target point slightly toward the left side
@@ -556,6 +743,16 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                         pattern = random.choice(cluster_patterns)
                     else:
                         pattern = [0]
+
+                    launch_sound = None
+                    if mixer_available:
+                        if proj_type["name"] == "fireball":
+                            launch_sound = fireball_sound
+                        elif proj_type["name"] in ("arrow", "javelin"):
+                            if len(pattern) > 1:
+                                launch_sound = arrow_multi_sound or arrow_single_sound
+                            else:
+                                launch_sound = arrow_single_sound
 
                     vertical_step = int(current_dragon_img.get_height() * 0.2)
 
@@ -613,6 +810,9 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                             }
                         )
 
+                    if launch_sound:
+                        launch_sound.play()
+
         # Move projectiles (with optional swirl) and check collisions with player dragons
         if state == "playing":
             for proj in projectiles[:]:
@@ -661,9 +861,9 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                         interpolated_strengths[idx],
                         window_height,
                         current_dragon_img.get_height(),
-                        # Same expanded vertical range as in the draw pass
-                        top_margin=int(80 * ui_scale),
-                        bottom_margin=int(4 * ui_scale),
+                        # Same expanded vertical range as in the draw pass.
+                        top_margin=int(30 * ui_scale),
+                        bottom_margin=int(0 * ui_scale),
                     )
                     dragon_x = int(dragon_center_x - current_dragon_img.get_width() / 2)
                     dragon_rect = pygame.Rect(
@@ -679,6 +879,9 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                             continue
 
                         hit_players.add(idx)
+
+                        if state == "playing" and hit_sound:
+                            hit_sound.play()
 
                         # Mark hit for swirl animation and deduct score
                         hit_timers[idx] = 0.6
@@ -738,14 +941,37 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
             border_alpha=180,
         )
         screen.blit(task_surf, task_rect)
+        
+        # Display "SIMULATED" indicator during calibration stages
+        if simulation_active:
+            simulated_label = "SIMULATED"
+            simulated_surf = small_font.render(simulated_label, True, (239, 68, 68))  # Red color
+            simulated_rect = simulated_surf.get_rect()
+            simulated_rect.centerx = window_width // 2
+            simulated_rect.top = padded_rect.bottom + int(2 * ui_scale)
+            simulated_panel = simulated_rect.inflate(int(16 * ui_scale), int(6 * ui_scale))
+            draw_glass_panel(
+                screen,
+                simulated_panel,
+                base_color=(254, 226, 226),  # Light red background
+                radius=int(10 * ui_scale),
+                fill_alpha=150,
+                border_alpha=200,
+            )
+            screen.blit(simulated_surf, simulated_rect)
+            
+            # Adjust timer position to be below the simulated label
+            timer_top_offset = simulated_panel.bottom + int(4 * ui_scale)
+        else:
+            timer_top_offset = padded_rect.bottom + int(4 * ui_scale)
 
-        # Timer display under the task badge
+        # Timer display under the task badge (or under simulated indicator if present)
         seconds_left = int(time_remaining + 0.999)  # ceil for display
         timer_text = f"Time left: {seconds_left}s" if state == "playing" else "Time's up!"
         timer_surf = small_font.render(timer_text, True, (17, 24, 39))
         timer_rect = timer_surf.get_rect()
         timer_rect.centerx = window_width // 2
-        timer_rect.top = padded_rect.bottom + int(4 * ui_scale)
+        timer_rect.top = timer_top_offset
         timer_panel = timer_rect.inflate(int(20 * ui_scale), int(6 * ui_scale))
         draw_glass_panel(
             screen,
@@ -779,8 +1005,8 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                 current_strength,
                 window_height,
                 current_dragon_img.get_height(),
-                top_margin=int(80 * ui_scale),
-                bottom_margin=int(4 * ui_scale),
+                top_margin=int(30 * ui_scale),
+                bottom_margin=int(0 * ui_scale),
             )
 
             # Base center for the sprite
@@ -954,32 +1180,195 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
         )
         screen.blit(relaxed_surf, relaxed_rect)
 
-        # Overlay per-player strength/score summary at the bottom in its own glass panel,
-        # clearly indicating which values belong to which player.
+        # Display per-player score and focus prominently at top-left
         if show_score:
-            summary_parts = []
+            # Starting position for score display (top-left area)
+            score_start_x = int(24 * ui_scale)
+            score_start_y = int(24 * ui_scale)
+            score_line_height = int(70 * ui_scale)
+            
             for idx, player in enumerate(players):
-                summary_parts.append(
-                    f"P{player.number} ({player.name}) - Focus: {local_strengths[idx]}  Score: {scores[idx]}"
+                # Position for this player's score panel
+                current_y = score_start_y + idx * score_line_height
+                
+                # Create score text with larger font
+                score_text = f"P{player.number} {player.name}"
+                score_value = f"Score: {scores[idx]}  |  Focus: {local_strengths[idx]}"
+                
+                # Render player name/number
+                name_surf = font.render(score_text, True, (17, 24, 39))
+                name_rect = name_surf.get_rect()
+                name_rect.topleft = (score_start_x + int(20 * ui_scale), current_y + int(8 * ui_scale))
+                
+                # Render score/focus values with task_font (bigger)
+                value_surf = task_font.render(score_value, True, (17, 24, 39))
+                value_rect = value_surf.get_rect()
+                value_rect.topleft = (score_start_x + int(20 * ui_scale), name_rect.bottom + int(2 * ui_scale))
+                
+                # Calculate panel size to fit both lines
+                panel_width = max(name_rect.width, value_rect.width) + int(40 * ui_scale)
+                panel_height = int(60 * ui_scale)
+                panel_rect = pygame.Rect(
+                    score_start_x,
+                    current_y,
+                    panel_width,
+                    panel_height
                 )
-            # Use a simple bullet separator between players
-            summary_text = "   •   ".join(summary_parts)
-            summary_surf = small_font.render(summary_text, True, (17, 24, 39))
-            summary_rect = summary_surf.get_rect()
-            summary_rect.midbottom = (
-                window_width // 2,
-                window_height - int(12 * ui_scale),
-            )
-            summary_panel = summary_rect.inflate(int(32 * ui_scale), int(10 * ui_scale))
+                
+                # Draw glass panel background
+                draw_glass_panel(
+                    screen,
+                    panel_rect,
+                    base_color=(255, 255, 255),
+                    radius=int(18 * ui_scale),
+                    fill_alpha=180,
+                    border_alpha=220,
+                )
+                
+                # Draw the text
+                screen.blit(name_surf, name_rect)
+                screen.blit(value_surf, value_rect)
+
+        # Training results overlay
+        if state == "training_results" and game_state:
+            overlay = pygame.Surface((window_width, window_height), pygame.SRCALPHA)
+            overlay.fill((15, 23, 42, 220))  # Dark overlay
+            screen.blit(overlay, (0, 0))
+
+            panel_width = int(window_width * 0.7)
+            panel_height = int(window_height * 0.6)
+            panel_rect = pygame.Rect(0, 0, panel_width, panel_height)
+            panel_rect.center = (window_width // 2, window_height // 2)
             draw_glass_panel(
                 screen,
-                summary_panel,
+                panel_rect,
                 base_color=(255, 255, 255),
-                radius=int(16 * ui_scale),
-                fill_alpha=150,
-                border_alpha=200,
+                radius=int(24 * ui_scale),
+                fill_alpha=250,
+                border_alpha=255,
             )
-            screen.blit(summary_surf, summary_rect)
+
+            # Title
+            title_text = "Training Complete"
+            title_color = (34, 197, 94)  # Green
+            title_surf = task_font.render(title_text, True, title_color)
+            title_rect = title_surf.get_rect()
+            title_rect.centerx = panel_rect.centerx
+            title_rect.top = panel_rect.top + int(30 * ui_scale)
+            screen.blit(title_surf, title_rect)
+
+            # Display results for each player
+            training_results = game_state.get("training_results", [])
+            line_y = title_rect.bottom + int(40 * ui_scale)
+            line_spacing = int(50 * ui_scale)
+            
+            for idx, result in enumerate(training_results):
+                player_name = result.get("name", f"Player {idx+1}")
+                accuracy = result.get("accuracy")
+                samples = result.get("samples", 0)
+                
+                # Player name
+                name_surf = font.render(f"P{idx+1}: {player_name}", True, (17, 24, 39))
+                name_rect = name_surf.get_rect()
+                name_rect.left = panel_rect.left + int(40 * ui_scale)
+                name_rect.top = line_y
+                screen.blit(name_surf, name_rect)
+                
+                # Accuracy and samples
+                if accuracy is not None:
+                    acc_percent = accuracy * 100
+                    acc_text = f"Accuracy: {acc_percent:.1f}%"
+                    # Color based on accuracy
+                    if acc_percent >= 80:
+                        acc_color = (34, 197, 94)  # Green
+                    elif acc_percent >= 60:
+                        acc_color = (234, 179, 8)  # Yellow
+                    else:
+                        acc_color = (239, 68, 68)  # Red
+                else:
+                    acc_text = "Accuracy: N/A"
+                    acc_color = (107, 114, 128)  # Gray
+                
+                acc_surf = font.render(acc_text, True, acc_color)
+                acc_rect = acc_surf.get_rect()
+                acc_rect.left = name_rect.left
+                acc_rect.top = name_rect.bottom + int(5 * ui_scale)
+                screen.blit(acc_surf, acc_rect)
+                
+                # Sample count
+                samples_text = f"Samples: {samples}"
+                samples_surf = small_font.render(samples_text, True, (107, 114, 128))
+                samples_rect = samples_surf.get_rect()
+                samples_rect.left = acc_rect.right + int(20 * ui_scale)
+                samples_rect.centery = acc_rect.centery
+                screen.blit(samples_surf, samples_rect)
+                
+                line_y += line_spacing
+            
+            # "Starting Live Play..." message
+            footer_text = "Starting Live Play..."
+            footer_surf = small_font.render(footer_text, True, (107, 114, 128))
+            footer_rect = footer_surf.get_rect()
+            footer_rect.centerx = panel_rect.centerx
+            footer_rect.bottom = panel_rect.bottom - int(20 * ui_scale)
+            screen.blit(footer_surf, footer_rect)
+
+        # Preparation countdown overlay
+        if state == "preparation":
+            overlay = pygame.Surface((window_width, window_height), pygame.SRCALPHA)
+            overlay.fill((15, 23, 42, 200))  # Dark overlay
+            screen.blit(overlay, (0, 0))
+
+            panel_width = int(window_width * 0.6)
+            panel_height = int(window_height * 0.5)
+            panel_rect = pygame.Rect(0, 0, panel_width, panel_height)
+            panel_rect.center = (window_width // 2, window_height // 2)
+            draw_glass_panel(
+                screen,
+                panel_rect,
+                base_color=(255, 255, 255),
+                radius=int(24 * ui_scale),
+                fill_alpha=250,
+                border_alpha=255,
+            )
+
+            prep_task_lower = preparation_task_type.lower()
+            if "relax" in prep_task_lower:
+                title_text = "RELAX Coming Up"
+                instruction_text = "Relax to make the dragon go down"
+                color = (59, 130, 246)  # Cool Blue
+            elif "focus" in prep_task_lower:
+                title_text = "FOCUS Coming Up"
+                instruction_text = "Focus to make the dragon go up"
+                color = (249, 115, 22)  # Warm Orange
+            else:
+                title_text = "Get Ready"
+                instruction_text = ""
+                color = (107, 114, 128)
+
+            # Title
+            title_surf = task_font.render(title_text, True, color)
+            title_rect = title_surf.get_rect()
+            title_rect.centerx = panel_rect.centerx
+            title_rect.top = panel_rect.top + int(40 * ui_scale)
+            screen.blit(title_surf, title_rect)
+
+            # Countdown number (large)
+            countdown_seconds = int(preparation_time_remaining + 0.999)
+            countdown_font_size = max(80, int(80 * ui_scale))
+            countdown_font = make_font(countdown_font_size, bold=True)
+            countdown_surf = countdown_font.render(str(countdown_seconds), True, color)
+            countdown_rect = countdown_surf.get_rect()
+            countdown_rect.center = panel_rect.center
+            screen.blit(countdown_surf, countdown_rect)
+
+            # Instruction text
+            if instruction_text:
+                instruction_surf = font.render(instruction_text, True, (17, 24, 39))
+                instruction_rect = instruction_surf.get_rect()
+                instruction_rect.centerx = panel_rect.centerx
+                instruction_rect.bottom = panel_rect.bottom - int(40 * ui_scale)
+                screen.blit(instruction_surf, instruction_rect)
 
         # Game-over overlay: show final scores, declare winner, and offer rematch options.
         if state == "game_over":
@@ -1017,16 +1406,19 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
             title_rect.top = panel_rect.top + int(24 * ui_scale)
             screen.blit(title_surf, title_rect)
 
-            # Score lines for each player, with a subtle pulse animation
-            # on the winner's row.
-            line_y = title_rect.bottom + int(24 * ui_scale)
-            line_spacing = int(28 * ui_scale)
+            # Get training results from game_state if available
+            training_results = game_state.get("training_results", []) if game_state else []
+            training_accuracy_map = {r.get("name", ""): r.get("accuracy") for r in training_results}
+
+            # Score and accuracy lines for each player, with pulse animation on winner's row
+            line_y = title_rect.bottom + int(30 * ui_scale)
+            line_spacing = int(45 * ui_scale)
             for idx, player in enumerate(players):
                 base_color = (17, 24, 39)
                 if idx in winner_indices and not is_tie:
-                    # Warm accent for the winner
-                    base_color = (234, 179, 8)
+                    base_color = (234, 179, 8)  # Warm accent for the winner
 
+                # Player name and score
                 score_text = f"P{player.number} {player.name} — Score: {scores[idx]}"
                 line_surf = font.render(score_text, True, base_color)
                 line_rect = line_surf.get_rect()
@@ -1034,12 +1426,36 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
                 line_rect.top = line_y
 
                 if idx in winner_indices and not is_tie:
-                    # Pulse the winner row slightly for a simple animation effect.
+                    # Pulse the winner row slightly
                     scale = 1.0 + 0.08 * math.sin(winner_pulse_time * 4.0)
                     line_surf = pygame.transform.rotozoom(line_surf, 0, scale)
                     line_rect = line_surf.get_rect(center=line_rect.center)
 
                 screen.blit(line_surf, line_rect)
+                
+                # Model accuracy below the score
+                player_name = player.name
+                accuracy = training_accuracy_map.get(player_name)
+                if accuracy is not None:
+                    acc_percent = accuracy * 100
+                    acc_text = f"Model Accuracy: {acc_percent:.1f}%"
+                    # Color based on accuracy
+                    if acc_percent >= 80:
+                        acc_color = (34, 197, 94)  # Green
+                    elif acc_percent >= 60:
+                        acc_color = (234, 179, 8)  # Yellow
+                    else:
+                        acc_color = (239, 68, 68)  # Red
+                else:
+                    acc_text = "Model Accuracy: N/A"
+                    acc_color = (107, 114, 128)  # Gray
+                
+                acc_surf = small_font.render(acc_text, True, acc_color)
+                acc_rect = acc_surf.get_rect()
+                acc_rect.centerx = panel_rect.centerx
+                acc_rect.top = line_rect.bottom + int(4 * ui_scale)
+                screen.blit(acc_surf, acc_rect)
+                
                 line_y += line_spacing
 
             # Buttons for rematch and starting fresh
@@ -1113,6 +1529,12 @@ async def run_game_loop(game_state: Optional[Dict[str, Any]] = None) -> None:
             screen.blit(startfresh_surf, startfresh_text_rect)
 
         pygame.display.flip()
+
+    if mixer_available and music_started:
+        try:
+            pygame.mixer.music.stop()
+        except pygame.error:
+            pass
 
     pygame.quit()
 

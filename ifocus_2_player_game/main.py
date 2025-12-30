@@ -47,16 +47,19 @@ logger.setLevel(logging.INFO)  # Keep main at INFO, but allow DEBUG from SDK
 # Calibration settings
 NUM_RELAX_ROUNDS = 1        # Number of RELAX calibration rounds
 NUM_FOCUS_ROUNDS = 1        # Number of FOCUS calibration rounds
-RELAX_DURATION = 10         # Duration of each RELAX round (seconds)
-FOCUS_DURATION = 10         # Duration of each FOCUS round (seconds)
+RELAX_DURATION = 20         # Duration of each RELAX round (seconds)
+FOCUS_DURATION = 20         # Duration of each FOCUS round (seconds)
+PREPARATION_DURATION = 3.0  # Preparation countdown before RELAX/FOCUS stages (seconds)
 
 # Live play settings
-LIVE_DURATION = 60          # Duration of live gameplay (seconds)
-INFERENCE_UPDATE_HZ = 2.0   # Focus score updates per second during live play
+LIVE_DURATION = 120          # Duration of live gameplay (seconds)
+# Smaller hop (more frequent predictions): hop_sec = 1 / INFERENCE_UPDATE_HZ.
+# With the default 500Hz sample rate, 50.0Hz => 0.02s hop (10 samples).
+INFERENCE_UPDATE_HZ = 20.0   # Focus score updates per second during live play
 
 # Projectile and obstacle settings
 PROJECTILE_BASE_SPEED = 80      # Base speed multiplier for projectiles (pixels/second, scaled by UI)
-PROJECTILE_SPAWN_INTERVAL = 8.0 # Time between projectile spawns (seconds)
+PROJECTILE_SPAWN_INTERVAL = 15.0 # Time between projectile spawns (seconds)
 # ============================================================
 
 class GameController:
@@ -93,6 +96,25 @@ class GameController:
 
     async def _scan(self):
         try:
+            # Always clear any existing BLE connections before scanning to avoid stale sessions.
+            try:
+                await calibrationControl('disconnect')
+            except Exception as e:
+                logger.warning(f"Forced disconnect before scan failed: {e}")
+
+            # Disconnect all currently connected devices before scanning
+            if self.connected_devices:
+                logger.info(f"Disconnecting {len(self.connected_devices)} connected device(s) before scan...")
+                for mac in list(self.connected_devices):
+                    try:
+                        await calibrationControl('disconnect', deviceId=mac)
+                        self.window.set_connection_state(mac, "disconnected")
+                        logger.info(f"Disconnected {mac}")
+                    except Exception as e:
+                        logger.warning(f"Failed to disconnect {mac}: {e}")
+                self.connected_devices.clear()
+                self.window.set_status("Disconnected all devices. Scanning...")
+            
             logger.info("Scanning for devices...")
             # _scan_ifocus_devices returns list of (addr, name, rssi)
             devices_raw = await _scan_ifocus_devices(timeout_s=6.0)
@@ -222,24 +244,51 @@ class GameController:
         async def run_stage_logic(task_type, duration):
             logger.info(f"Starting stage: {task_type}")
             
-            # Update game state to trigger UI transition
+            # Update game state to trigger UI transition (includes preparation phase)
+            # The UI will display preparation countdown, then actual stage
             game_state["stage"] = {
                 "id": f"{task_type}_{time.time()}",
                 "type": task_type,
-                "duration": duration
+                "duration": duration  # This is just the data collection duration
             }
             
-            # Start data collection using player names as subjectId
+            # Wait for preparation phase to complete (5 seconds countdown)
+            logger.info(f"Preparation phase: {PREPARATION_DURATION} seconds")
+            prep_end_time = asyncio.get_event_loop().time() + PREPARATION_DURATION
+            while asyncio.get_event_loop().time() < prep_end_time:
+                if not ui_thread.is_alive():
+                    logger.info("UI closed during preparation, aborting stage")
+                    return False  # Signal that stage was aborted
+                
+                # Update wearing status during preparation
+                current_wearing = []
+                for mac in macs:
+                    parser = _multi_parsers.get(mac)
+                    if parser:
+                        current_wearing.append(parser.wearing_status)
+                    else:
+                        current_wearing.append(False)
+                game_state["wearing"] = current_wearing
+                
+                await asyncio.sleep(0.1)
+            
+            # Check again before starting data collection
+            if not ui_thread.is_alive():
+                logger.info("UI closed before data collection, aborting stage")
+                return False
+            
+            # NOW start data collection after preparation completes
+            logger.info(f"Preparation complete. Starting data collection for {duration} seconds")
             for mac in macs:
                 player_name = mac_to_name[mac]
                 logger.info(f"Starting data collection for {player_name} (device {mac}) - {task_type}")
                 await calibrationControl('start', deviceId=mac, subjectId=player_name, stateLabel=task_type)
             
-            # Wait for duration
+            # Wait for data collection duration (not including preparation)
             end_time = asyncio.get_event_loop().time() + duration
             while asyncio.get_event_loop().time() < end_time:
                 if not ui_thread.is_alive():
-                    logger.warning("UI closed unexpectedly")
+                    logger.info("UI closed during data collection, stopping early")
                     break
                 
                 # Update wearing status
@@ -259,6 +308,8 @@ class GameController:
                 player_name = mac_to_name[mac]
                 result = await calibrationControl('stop', deviceId=mac, subjectId=player_name)
                 logger.info(f"Stopped data collection for {player_name}: {result}")
+            
+            return ui_thread.is_alive()  # Return True if stage completed successfully
 
         async def run_live_stage(duration):
             """Live stage driven only by inference (no extra recording)."""
@@ -293,28 +344,78 @@ class GameController:
 
             if calibrate:
                 # Run calibration rounds based on configuration
-                for round_num in range(NUM_RELAX_ROUNDS):
-                    logger.info(f"RELAX round {round_num + 1}/{NUM_RELAX_ROUNDS}")
-                    await run_stage_logic("RELAX", RELAX_DURATION)
-                
                 for round_num in range(NUM_FOCUS_ROUNDS):
                     logger.info(f"FOCUS round {round_num + 1}/{NUM_FOCUS_ROUNDS}")
-                    await run_stage_logic("FOCUS", FOCUS_DURATION)
+                    success = await run_stage_logic("FOCUS", FOCUS_DURATION)
+                    if not success:
+                        logger.info("UI closed during FOCUS calibration, aborting session")
+                        return
+                    
+                for round_num in range(NUM_RELAX_ROUNDS):
+                    logger.info(f"RELAX round {round_num + 1}/{NUM_RELAX_ROUNDS}")
+                    success = await run_stage_logic("RELAX", RELAX_DURATION)
+                    if not success:
+                        logger.info("UI closed during RELAX calibration, aborting session")
+                        return
+                
+
+                # Check if UI is still alive before training
+                if not ui_thread.is_alive():
+                    logger.info("UI closed before training, aborting session")
+                    return
 
                 logger.info("Training models...")
                 from ifocus_sdk.APIs.trainFocusModel import trainFocusModel
 
+                training_results = []
                 for mac in macs:
                     player_name = mac_to_name[mac]
-                    def cb(success, msg, n):
-                        logger.info(f"[{player_name}] Training: {msg}")
-                    trainFocusModel(player_name, cb)
+                    player_result = {"name": player_name, "accuracy": None, "samples": 0, "message": ""}
+                    
+                    def make_callback(result_dict):
+                        def cb(success, msg, n):
+                            logger.info(f"[{result_dict['name']}] Training: {msg}")
+                            result_dict["samples"] = n
+                            result_dict["message"] = msg
+                            # Try to extract accuracy from message
+                            if "accuracy:" in msg.lower():
+                                try:
+                                    acc_str = msg.split("accuracy:")[1].split()[0]
+                                    result_dict["accuracy"] = float(acc_str)
+                                except:
+                                    pass
+                        return cb
+                    
+                    trainFocusModel(player_name, make_callback(player_result))
+                    training_results.append(player_result)
+                
+                # Check if UI is still alive before showing results
+                if not ui_thread.is_alive():
+                    logger.info("UI closed after training, aborting session")
+                    return
+                
+                # Show training results for 4 seconds
+                logger.info("Displaying training results...")
+                game_state["training_results"] = training_results
+                game_state["stage"] = {
+                    "id": f"TRAINING_RESULTS_{time.time()}",
+                    "type": "TRAINING_RESULTS",
+                    "duration": 4.0
+                }
+                await asyncio.sleep(4.0)
+                
+                # Check if UI is still alive before starting inference
+                if not ui_thread.is_alive():
+                    logger.info("UI closed during training results, aborting session")
+                    return
 
             # Start Inference
             logger.info("Starting Inference...")
             from ifocus_sdk.APIs.FocusInference import startFocusInference, stopFocusInference
 
             mac_to_idx = {mac: i for i, mac in enumerate(macs)}
+            # Maintain a smoothed focus strength to avoid sharp jumps from inference noise.
+            smoothed_strengths = [float(v) for v in game_state["strengths"]]
             inference_tasks = []
             for mac in macs:
                 client = await calibrationControl('client', deviceId=mac)
@@ -324,13 +425,23 @@ class GameController:
 
                     def make_callback(device_idx):
                         def cb(label, strength, timestamp):
-                            game_state["strengths"][device_idx] = int(strength)
+                            # Exponential moving average to smooth focus index before UI uses it.
+                            smoothed_strengths[device_idx] = (
+                                0.85 * smoothed_strengths[device_idx] + 0.15 * float(strength)
+                            )
+                            # Clamp to 0-100 as expected by UI
+                            smoothed_strengths[device_idx] = max(0.0, min(100.0, smoothed_strengths[device_idx]))
+                            game_state["strengths"][device_idx] = int(smoothed_strengths[device_idx])
                         return cb
 
-                    task = asyncio.create_task(
-                        startFocusInference(player_name, client, updateHz=INFERENCE_UPDATE_HZ, callback=make_callback(idx))
-                    )
-                    inference_tasks.append((mac, player_name, client, task))
+                    try:
+                        task = asyncio.create_task(
+                            startFocusInference(player_name, client, updateHz=INFERENCE_UPDATE_HZ, callback=make_callback(idx))
+                        )
+                        inference_tasks.append((mac, player_name, client, task))
+                    except Exception as e:
+                        logger.error(f"Failed to start inference for {player_name}: {e}")
+                        # Continue with other players even if one fails
 
             try:
                 await run_live_stage(live_duration)
