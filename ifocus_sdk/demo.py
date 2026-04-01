@@ -200,12 +200,10 @@ async def demo_calibration():
     # 1.5. Check wearing status before calibration
     await check_wearing_status()
     
-    # 2. Run calibration in alternating blocks: FOCUS -> RELAX -> FOCUS -> RELAX
+    # 2. Run calibration blocks (optimized: 20s each)
     state_sequence = [
-        ("FOCUS", 10),
-        ("RELAX", 10),
-        ("FOCUS", 10),
-        ("RELAX", 10),
+        ("FOCUS", 20),
+        ("RELAX", 20),
     ]
     
     for state_label, duration in state_sequence:
@@ -288,8 +286,8 @@ async def demo_inference(subject_id: str, found_devices: dict):
     device_id, name = result
     
     # 3. Run live inference (first session)
-    print("\n--- Live focus inference (5 seconds) ---")
-    update_hz = 2.0
+    print("\n--- Live focus inference (10 seconds) ---")
+    update_hz = 20.0
     ble_client = _get_client()
     
     try:
@@ -298,7 +296,7 @@ async def demo_inference(subject_id: str, found_devices: dict):
             print("Failed to start focus inference.")
             return
         
-        await asyncio.sleep(5.0)
+        await asyncio.sleep(10.0)
         
         # 4. Pause inference
         await stopFocusInference()
@@ -309,12 +307,12 @@ async def demo_inference(subject_id: str, found_devices: dict):
         await asyncio.get_event_loop().run_in_executor(None, input)
         
         # 5. Resume inference (second session)
-        print("\n--- Resuming inference (5 seconds) ---")
+        print("\n--- Resuming inference (10 seconds) ---")
         started = await startFocusInference(subject_id, ble_client, update_hz, _focus_callback)
         if not started:
             print("Failed to resume focus inference.")
         else:
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(10.0)
         
     finally:
         await stopFocusInference()
